@@ -2,24 +2,36 @@
 #include "train_gpt2.c"
 
 // poor man's tensor checker
-int check_tensor(float *a, float *b, int n, char* label) {
+int check_tensor(float *a, float *b, int n, const char* label) {
     int print_upto = 5;
     int ok = 1;
+    float maxdiff = 0.0f;
+    float tol = 2e-2;
     printf("%s\n", label);
     for (int i = 0; i < n; i++) {
-        if (fabsf(a[i] - b[i]) <= 1e-2) {
-            if (i < print_upto) { printf("OK "); }
-        } else {
-            if (i < print_upto) { printf("NOT OK "); }
-            ok = 0;
+        // look at the diffence at position i of these two tensors
+        float diff = fabsf(a[i] - b[i]);
+
+        // keep track of the overall error
+        ok = ok && (diff <= tol);
+        if (diff > maxdiff) { maxdiff = diff; }
+
+        // for the first few elements of each tensor, pretty print
+        // the actual numbers, so we can do a visual, qualitative proof/assessment
+        if (i < print_upto) {
+            if (diff <= tol) {
+                if (i < print_upto) { printf("OK "); }
+            } else {
+                if (i < print_upto) { printf("NOT OK "); }
+            }
+            printf("%f %f\n", a[i], b[i]);
         }
-        if (i < print_upto) { printf("%f %f\n", a[i], b[i]); }
     }
-    // print the final result
+    // print the final result for this tensor
     if (ok) {
-        printf("TENSOR OK\n");
+        printf("TENSOR OK, maxdiff = %e\n", maxdiff);
     } else {
-        printf("TENSOR NOT OK\n");
+        printf("TENSOR NOT OK, maxdiff = %e\n", maxdiff);
     }
     return ok;
 }
@@ -32,6 +44,7 @@ int main(int argc, char *argv[]) {
 
     int C = model.config.channels;
     int V = model.config.vocab_size;
+    int Vp = model.config.padded_vocab_size;
     int maxT = model.config.max_seq_len;
     int L = model.config.num_layers;
 
@@ -40,8 +53,12 @@ int main(int argc, char *argv[]) {
     if (state_file == NULL) { printf("Error opening state file\n"); return 1; }
     int state_header[256];
     fread(state_header, sizeof(int), 256, state_file);
-    if (state_header[0] != 20240327) { printf("Bad magic state file"); return 1; }
-    if (state_header[1] != 1) { printf("Bad version in state file"); return 1; }
+    if (state_header[0] != 20240327) { printf("Bad magic state file\n"); return 1; }
+    if (state_header[1] != 2) {
+        printf("Bad version in state file\n");
+        printf("---> HINT: try to re-run `python train_gpt2.py`\n");
+        return 1;
+    }
     int B = state_header[2]; // batch size, e.g. 4
     int T = state_header[3]; // time / sequence length (e.g. 64, up to maxT)
     printf("[State]\n");
@@ -69,7 +86,18 @@ int main(int argc, char *argv[]) {
     int allok = 1;
 
     // let's do 10 training iterations, following the pytorch code
-    float losses[10];
+    float expected_losses[10] = {
+        5.270007133483887,
+        4.059706687927246,
+        3.3751230239868164,
+        2.8007826805114746,
+        2.315382242202759,
+        1.8490285873413086,
+        1.3946564197540283,
+        0.9991465210914612,
+        0.6240804195404053,
+        0.37651097774505615
+    };
     for (int step = 0; step < 10; step++) {
 
         struct timespec start, end;
@@ -84,22 +112,29 @@ int main(int argc, char *argv[]) {
 
         if (step == 0) {
             // error checking at step 0 for reference activations/gradients
-
             // at this point, target should be equal to expected_logits, let's compare
             int logits_ok = 1;
-            for (int i=0; i<B*T*V; i++) {
-                if(i < 3) {
-                    printf("%f %f\n", expected_logits[i], model.acts.logits[i]);
-                }
-                if (fabsf(expected_logits[i] - model.acts.logits[i]) >= 1e-2) {
-                    printf("MISMATCH AT INDEX %d: ", i);
-                    printf("%f %f\n", expected_logits[i],model.acts.logits[i]);
-                    logits_ok = 0;
-                    break;
+            float* calculated_logits = model.acts.logits;
+            float max_diff = 0.0f;
+            for (int bt = 0; bt < B*T; bt++) {
+                for (int v = 0; v < V; v++) { // note we only loop to V (ignoring padding)
+                    int i = bt * Vp + v; // linearized index, using Vp
+                    if (i < 10) {
+                        printf("%f, %f\n", expected_logits[i], calculated_logits[i]);
+                    }
+                    float diff = fabsf(expected_logits[bt*V + v] - calculated_logits[i]);
+                    max_diff = fmaxf(max_diff, diff);
+                    if (diff >= 1e-2f) {
+                        printf("MISMATCH AT INDEX %d,%d: ", bt, v);
+                        printf("%f %f\n", expected_logits[bt*V + v], calculated_logits[i]);
+                        logits_ok = 0;
+                        bt = B*T; // to break out of both loops
+                        break;
+                    }
                 }
             }
             if(!logits_ok) { printf("NOT "); }
-            printf("OK (LOGITS)\n");
+            printf("OK (LOGITS), max_diff = %e\n", max_diff);
             allok = allok && logits_ok;
 
             // compare the achieved loss
@@ -136,34 +171,17 @@ int main(int argc, char *argv[]) {
 
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.01f, step+1);
 
+        // compare the losses
+        float expected_loss = expected_losses[step];
+        float actual_loss = model.mean_loss;
+        int step_loss_ok = fabsf(expected_loss - actual_loss) < 1e-2;
+        allok = allok && step_loss_ok;
+
         // print the timing information at the end
-        printf("step %d: loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
-        losses[step] = model.mean_loss;
+        printf("step %d: loss %f (took %f ms) OK = %d\n", step, model.mean_loss, time_elapsed_s * 1000, step_loss_ok);
     }
 
-    // expected losses are as follows, from Python
-    float expected_losses[10] = {
-        5.270007133483887,
-        4.059706687927246,
-        3.3751230239868164,
-        2.8007826805114746,
-        2.315382242202759,
-        1.8490285873413086,
-        1.3946564197540283,
-        0.9991465210914612,
-        0.6240804195404053,
-        0.37651097774505615
-    };
-    // compare
-    for (int i = 0; i < 10; i++) {
-        if (fabsf(losses[i] - expected_losses[i]) >= 1e-2) {
-            printf("LOSS MISMATCH AT STEP %d: %f %f\n", i, losses[i], expected_losses[i]);
-            allok = 0;
-        } else {
-            printf("loss ok at step %d: %f %f\n", i, losses[i], expected_losses[i]);
-        }
-    }
-
+    // final judgement
     printf("overall okay: %d\n", allok);
 
     // free everything
