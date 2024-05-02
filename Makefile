@@ -58,6 +58,12 @@ train_gpt2cu: train_gpt2.cu
 test_gpt2cu: test_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
 
+train_gpt2sycl: train_gpt2.cpp
+	icpx -O3 -fsycl $< -ldnnl -o $@
+
+test_gpt2sycl: test_gpt2.cpp
+	icpx -O3 -fsycl $< -ldnnl -o $@
+
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
 
