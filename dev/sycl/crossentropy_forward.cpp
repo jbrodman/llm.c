@@ -52,26 +52,26 @@ void crossentropy_forward_kernel1(sycl::nd_item<1> id, float* losses,
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void crossentropy_forward1(sycl::queue &queue, float* losses,
+void crossentropy_forward1(float* losses,
                             const float* probs, const int* targets,
                             int B, int T, int V,
                             const int block_size) {
     const int N = B * T;
     const int grid_size = ceil_div(N, block_size);
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         crossentropy_forward_kernel1(id, losses, probs, targets, B, T, V);
     });
 }
 
 // kernel version dispatch
-void crossentropy_forward(sycl::queue& queue, int kernel_num,
+void crossentropy_forward(int kernel_num,
                           float* losses,
                           const float* probs, const int* targets,
                           int B, int T, int V,
                           const int block_size) {
     switch (kernel_num) {
         case 1:
-            crossentropy_forward1(queue, losses, probs, targets, B, T, V, block_size);
+            crossentropy_forward1(losses, probs, targets, B, T, V, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -96,6 +96,7 @@ int main(int argc, char **argv) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
     }
+    DefaultQueue = &defaultQueue;
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * sizeof(float));
@@ -106,16 +107,13 @@ int main(int argc, char **argv) {
     float* d_out;
     float* d_probs;
     int* d_targets;
-    d_out = sycl::malloc_device<float>(B * T, defaultQueue);
-    d_probs = sycl::malloc_device<float>(B * T * V, defaultQueue);
-    d_targets = sycl::malloc_device<int>(B * T, defaultQueue);
-
-    syclMallocCheck(d_out);
-    syclMallocCheck(d_probs);
-    syclMallocCheck(d_targets);
+    syclMallocCheck(d_out = sycl::malloc_device<float>(B * T, defaultQueue));
+    syclMallocCheck(d_probs = sycl::malloc_device<float>(B * T * V, defaultQueue));
+    syclMallocCheck(d_targets = sycl::malloc_device<int>(B * T, defaultQueue));
 
     defaultQueue.memcpy(d_probs, probs, B * T * V * sizeof(float));
     defaultQueue.memcpy(d_targets, targets, B * T * sizeof(int));
+    defaultQueue.wait();
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -133,8 +131,8 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        crossentropy_forward(defaultQueue, kernel_num, d_out, d_probs, d_targets, B, T, V, block_size);
-        validate_result(defaultQueue, d_out, out, "out", B * T, 1e-5f);
+        crossentropy_forward(kernel_num, d_out, d_probs, d_targets, B, T, V, block_size);
+        validate_result(d_out, out, "out", B * T, 1e-5f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -143,7 +141,7 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(defaultQueue, repeat_times, crossentropy_forward,
+        float elapsed_time = benchmark_kernel(repeat_times, crossentropy_forward,
                                               kernel_num, d_out, d_probs, d_targets,
                                               B, T, V, block_size);
 

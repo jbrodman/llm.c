@@ -39,6 +39,14 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 namespace dnnlsycl = dnnl::sycl_interop;
 
 // ----------------------------------------------------------------------------
+// Floating point precision setup
+typedef sycl::half floatX; // half or __nv_bfloat16 (or float)
+
+// ----------------------------------------------------------------------------
+// CUDA & cuDNN setup
+static bool first_run_validation = true; // always run e.g. permute on 1st run
+
+// ----------------------------------------------------------------------------
 // CPU code reference
 
 void attention_forward_cpu(float* out, float* preatt, float* att,
@@ -523,33 +531,34 @@ void scale_kernel(sycl::nd_item<1> id, float* inp, float scale, int B, int NH, i
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void attention_forward1(sycl::queue& queue, float* out, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward1(float* out, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
     // attention calculation
     int total_threads = B * NH * T * T;
     int num_blocks = ceil_div(total_threads, block_size);
-    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         attention_query_key_kernel1(id, preatt, inp, B, T, C, NH);
     });
 
     // softmax and value accumulation
     total_threads = B * T * NH;
     num_blocks = ceil_div(total_threads, block_size);
-    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         attention_softmax_kernel1(id, att, preatt, B, T, NH);
     });
-    queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
         attention_value_kernel1(id, out, att, inp, B, T, C, NH);
     });
 }
 
 
-void attention_forward2(sycl::queue& queue, float* out,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward2(float* out,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    sycl::queue& queue = *DefaultQueue;
     // TODO there should be no mallocs inside any of these functions!
     // not fixing this because we don't intend to use attention_forward2,
     // it seems to be way too slow as is
@@ -644,10 +653,11 @@ void attention_forward2(sycl::queue& queue, float* out,
     sycl::free(v, queue);
 }
 
-void attention_forward3(sycl::queue& queue,  float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size) {
+    sycl::queue& queue = *DefaultQueue;
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
@@ -741,10 +751,11 @@ void attention_forward3(sycl::queue& queue,  float* out, float* vaccum, float* q
     });
 }
 
-void attention_forward4(sycl::queue& queue, float* out, float* vaccum, float* qkvr, float* preatt, float* att,
+void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
                         const float* inp,
                         int B, int T, int C, int NH,
                         const int block_size) {
+    sycl::queue& queue = *DefaultQueue;
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
@@ -831,25 +842,235 @@ void attention_forward4(sycl::queue& queue, float* out, float* vaccum, float* qk
     });
 }
 
+void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_temperature,
+                                  const floatX* inp, int N, int T) {
+    // inp, out shape: (N, T, T), where N = B * NH
+    // fuses the multiplication by scale inside attention
+    // directly autoregressive, so we only compute the lower triangular part
+    // uses the online softmax algorithm
+    assert(T % 4  == 0);
+    sycl::sub_group warp = id.get_sub_group();
+    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    if(idx >= N * T) {
+        return;
+    }
+    int own_pos = idx % T;
+    int pos_by_4 = own_pos / 4;
+
+    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    const floatX* x = inp + idx * T;
+
+    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    float maxval = -FLT_MAX;
+    float sumval = 0.0f;
+
+    // Same thing but without float4, one at a time
+    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+        float old_maxval = maxval;
+        for(int k = 0; k < 4; ++k) {
+            maxval = sycl::fmax(maxval, (float)x[4*i + k]);
+        }
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        for(int k = 0; k < 4; ++k) {
+            sumval += sycl::exp(inv_temperature * ((float)x[4*i + k] - maxval));
+        }
+    }
+
+    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+        float old_maxval = maxval;
+        maxval = sycl::fmax(maxval, (float)x[4*pos_by_4 + warp.get_local_linear_id()]);
+        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
+        sumval += sycl::exp(inv_temperature * ((float)x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+    }
+
+    float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>());
+    sumval *= sycl::exp(inv_temperature * (maxval - global_maxval));
+
+    float sum = sycl::reduce_over_group(warp, sumval, sycl::plus<float>());
+    float norm = 1.f / sum;
+
+    // divide the whole row by the sum
+    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+        // recalculation is faster than doing the round-trip through memory.
+        // Fix this later
+        //float ev = sycl::exp(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
+        //__stcs(out + idx * T + i, (floatX)(ev * norm));
+        float ev = sycl::exp(inv_temperature * ((float)x[i] - global_maxval));
+        out[idx * T + i] = (floatX)(ev * norm);
+    }
+}
+
+void permute_kernel_lowp(sycl::nd_item<1> id, floatX* q, floatX* k, floatX* v,
+                         const float* inp,
+                         int B, int N, int NH, int d) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+    int idx = id.get_global_id(0);
+
+    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int inp_idx = \
+            (b * N * 3 * NH * d)
+            +   (n * 3 * NH * d)
+            +       (0 * NH * d)
+            +          (nh_ * d)
+            +                d_;
+
+        q[idx] = (floatX)inp[inp_idx];
+        k[idx] = (floatX)inp[inp_idx + NH * d];
+        v[idx] = (floatX)inp[inp_idx + 2 * (NH * d)];
+    }
+}
+
+void unpermute_kernel_lowp(sycl::nd_item<1> id, const floatX* inp, float *out, int B, int N, int NH, int d) {
+   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    int idx = id.get_global_id(0);
+
+    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
+    if (idx < B * NH * N * d) {
+        int b = idx / (NH * N * d);
+        int rest = idx % (NH * N * d);
+        int nh_ = rest / (N * d);
+        rest = rest % (N * d);
+        int n = rest / d;
+        int d_ = rest % d;
+
+        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
+        out[other_idx] = (float)inp[idx];
+    }
+}
+
+void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt, floatX* att,
+                        const float* inp,
+                        int B, int T, int C, int NH,
+                        const int block_size, bool skip_permute=false) {
+    sycl::queue& queue = *DefaultQueue;
+    // FP16 version of kernel 4 (with permute/unpermute doing FP32<->FP16)
+    // That permute can be skipped on perf runs to analyse its performance impact
+    // inp is (B, T, 3C) QKV
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+
+    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
+    int HS = C / NH; // head size
+    floatX *q = qkvr + 0 * B * T * C;
+    floatX *k = qkvr + 1 * B * T * C;
+    floatX* v = qkvr + 2 * B * T * C;
+
+    int total_threads = B * NH * T * HS;
+    int num_blocks = ceil_div(total_threads, block_size);
+    if (!skip_permute || first_run_validation) {
+        queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+            permute_kernel_lowp(id, q, k, v, inp, B, T, NH, HS);
+        });
+    }
+
+    // batched matrix multiply with oneDNN
+    // Setup engine and stream
+    auto engine = dnnlsycl::make_engine(queue.get_device(), queue.get_context());
+    auto stream = dnnlsycl::make_stream(engine, queue);
+
+    // Create memory descriptors
+    auto q_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+    auto k_md = dnnl::memory::desc({B * NH, HS, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::acb);
+    auto preatt_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+
+    // Create memory objects
+    auto q_mem = dnnlsycl::make_memory(q_md, engine, dnnlsycl::memory_kind::usm, q);
+    auto k_mem = dnnlsycl::make_memory(k_md, engine, dnnlsycl::memory_kind::usm, k);
+    auto preatt_mem = dnnlsycl::make_memory(preatt_md, engine, dnnlsycl::memory_kind::usm, preatt);
+
+    // Create primitive descriptor
+    auto matmul_pd = dnnl::matmul::primitive_desc(engine, q_md, k_md, preatt_md);
+
+    // Create primitive
+    auto matmul_prim = dnnl::matmul(matmul_pd);
+ 
+    // Set arguments and execute
+    matmul_prim.execute(stream, {
+        {DNNL_ARG_SRC, q_mem},
+        {DNNL_ARG_WEIGHTS, k_mem},
+        {DNNL_ARG_DST, preatt_mem}
+    });
+
+    // multiply all elements of preatt elementwise by scale
+    float scale = 1.0f / sqrtf(HS);
+    int softmax_block_size = 256;
+    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    queue.parallel_for(sycl::nd_range<1>(grid_size * softmax_block_size, softmax_block_size), [=](sycl::nd_item<1> id) {
+        softmax_forward_kernel5_lowp(id, att, scale, preatt, B * NH, T);
+    });
+
+    // new approach: first cuBLAS another batched matmul
+    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    auto att_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);  
+    auto v_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+    auto vaccum_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+
+    // Create memory objects
+    auto att_mem = dnnlsycl::make_memory(att_md, engine, dnnlsycl::memory_kind::usm, att);
+    auto v_mem = dnnlsycl::make_memory(v_md, engine, dnnlsycl::memory_kind::usm, v);
+    auto vaccum_mem = dnnlsycl::make_memory(vaccum_md, engine, dnnlsycl::memory_kind::usm, vaccum);
+
+    // Create primitive descriptor
+    auto matmul_pd2 = dnnl::matmul::primitive_desc(engine, att_md, v_md, vaccum_md);
+
+    // Create primitive
+    auto matmul_prim2 = dnnl::matmul(matmul_pd2);
+ 
+    // Set arguments and execute
+    matmul_prim2.execute(stream, {
+        {DNNL_ARG_SRC, att_mem},
+        {DNNL_ARG_WEIGHTS, v_mem},
+        {DNNL_ARG_DST, vaccum_mem}
+    });
+
+    // now unpermute
+    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    num_blocks = ceil_div(B * T * C, block_size);
+    if(!skip_permute || first_run_validation) {
+        queue.parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
+            unpermute_kernel_lowp(id, vaccum, out, B, T, NH, HS);
+        });
+    }
+}
+
 // kernel version dispatch
-void attention_forward(sycl::queue& queue,
-                       int kernel_num,
-                       float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       const float* inp,
+void attention_forward(int kernel_num,
+                       float* out, float* stats, float* vaccum,
+                       float* qkvr, float* preatt, float* att,
+                       float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
     switch (kernel_num) {
         case 1:
-            attention_forward1(queue, out, preatt, att, inp, B, T, C, NH, block_size);
+            attention_forward1(out, preatt, att, inp, B, T, C, NH, block_size);
             break;
         case 2:
-            attention_forward2(queue, out, inp, B, T, C, NH, block_size);
+            attention_forward2(out, inp, B, T, C, NH, block_size);
             break;
         case 3:
-            attention_forward3(queue, out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            attention_forward3(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
             break;
         case 4:
-            attention_forward4(queue, out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+            break;
+        case 5:
+            attention_forward5(out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
+                               inp, B, T, C, NH, block_size, false);
+            break;
+        case 6: // skip permutes for perf passes (to analyse perf as if in/out were truly 16-bit)
+            attention_forward5(out, (floatX*)vaccum, (floatX*)qkvr,
+                               (floatX*)preatt, (floatX*)att,
+                               inp, B, T, C, NH, block_size, true);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -859,7 +1080,7 @@ void attention_forward(sycl::queue& queue,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
@@ -874,6 +1095,7 @@ int main(int argc, char **argv) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
     }
+    DefaultQueue = &defaultQueue;
    
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -883,6 +1105,7 @@ int main(int argc, char **argv) {
 
     // move to GPU
     float* d_out;
+    float* d_stats = nullptr; // for cuDNN
     float* d_vaccum;
     float* d_qkvr;
     float* d_preatt;
@@ -912,25 +1135,29 @@ int main(int argc, char **argv) {
     printf("Using kernel %d\n", kernel_num);
     int block_sizes[] = {32, 64, 128, 256, 512};
 
+     // Lower accuracy requirements for FP16 (1e-4f also too much for TF32 on kernels 3 & 4)
+    float accuracy_threshold = (kernel_num <= 4) ? 1e-3f : 1e-2f;
+
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        attention_forward(defaultQueue, kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
-        validate_result(defaultQueue, d_out, out, "out", B * T * C, 1e-4f);
+        // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
+        validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
         // but as for preatt and att, things get a bit more complicated:
-        if (kernel_num != 2) {
+        if (kernel_num != 2 && kernel_num < 5) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(defaultQueue, d_att, att, "att", B * T * C, 1e-4f);
+            validate_result(d_att, att, "att", B * NH * T * T, accuracy_threshold);
         }
-        if (kernel_num != 2 && kernel_num != 4) {
+        if (kernel_num != 2 && kernel_num < 4) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
-            validate_result(defaultQueue, d_preatt, preatt, "preatt", B * T * C, 1e-4f);
+            validate_result(d_preatt, preatt, "preatt", B * NH * T * T, accuracy_threshold);
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
@@ -940,9 +1167,9 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
         int repeat_times = 100;
 
-        float elapsed_time = benchmark_kernel(defaultQueue, repeat_times, attention_forward,
-                                              kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp,
-                                              B, T, C, NH, block_size);
+        float elapsed_time = benchmark_kernel(repeat_times, attention_forward,
+                                              kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att,
+                                              d_inp, B, T, C, NH, block_size);
 
         printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
