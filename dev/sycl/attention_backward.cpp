@@ -977,6 +977,7 @@ void attention_backward1(float* dinp, float* dqkvr, float* dpreatt, float* datt,
     int HS = C / NH; // head size
     const float alpha = 1.0f;
     const float beta = 1.0f; // note beta = 1.0f so that we accumulate gradients (+=)
+    // am I missing some DNNL post ops for beta?
     // unpack convenience pointers into q, k, v
     const float *q, *k, *v;
     q = qkvr + 0 * B * T * C;

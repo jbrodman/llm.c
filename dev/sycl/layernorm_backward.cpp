@@ -168,9 +168,9 @@ void atomicAddX(sycl::half* addr, sycl::half val) {
     uint32_t old_val = ref.load(); 
     uint32_t new_val = old_val;
     do {
-        sycl::vec<sycl::half, 2> h2 = *reinterpret_cast<sycl::vec<sycl::half, 2>*>(&old_val);
-        h2.x() += (ptr_val & 0x3) ? 0 : val;
-        h2.y() += (ptr_val & 0x3) ? val : 0;
+        sycl::marray<sycl::half, 2> h2 = *reinterpret_cast<sycl::marray<sycl::half, 2>*>(&old_val);
+        h2[0] += (ptr_val & 0x3) ? sycl::half(0.0f) : val;
+        h2[1] += (ptr_val & 0x3) ? val : sycl::half(0.0f);
         new_val = *reinterpret_cast<uint32_t*>(&h2);
     }
     while (!ref.compare_exchange_weak(old_val, new_val));
