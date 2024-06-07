@@ -420,79 +420,79 @@ void softmax_forward_kernel7(sycl::nd_item<1> id, float* out, const float* inp, 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void softmax_forward1(sycl::queue& queue, float* out, const float* inp, int N, int C, const int block_size) {
+void softmax_forward1(float* out, const float* inp, int N, int C, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel1(id, out, inp, N, C);
     });
 }
 
-void softmax_forward2(sycl::queue& queue, float* out, const float* inp, int N, int C, const int block_size) {
+void softmax_forward2(float* out, const float* inp, int N, int C, const int block_size) {
     int grid_size = N;
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel2(id, out, inp, N, C);
     });
 }
 
-void softmax_forward3(sycl::queue& queue, float* out, const float* inp, int N, int C, int block_size) {
+void softmax_forward3(float* out, const float* inp, int N, int C, int block_size) {
     block_size = 32; // awkward but ok. this one only works with block size 32
     int grid_size = N;
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel3(id, out, inp, N, C);
     });
 }
 
-void softmax_forward4(sycl::queue& queue, float* out, const float* inp, int N, int C, int block_size) {
+void softmax_forward4(float* out, const float* inp, int N, int C, int block_size) {
     int grid_size = N;
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel4(id, out, inp, N, C);
     });
 }
 
-void softmax_forward_online1(sycl::queue& queue, float* out, const float* inp, int N, int C, int block_size) {
+void softmax_forward_online1(float* out, const float* inp, int N, int C, int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_online_kernel1(id, out, inp, N, C);
     });
 }
 
-void softmax_forward_online2(sycl::queue& queue, float* out, const float* inp, int N, int C, int block_size) {
+void softmax_forward_online2(float* out, const float* inp, int N, int C, int block_size) {
     const int grid_size = ceil_div(N * 32, block_size);
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_online_kernel2(id, out, inp, N, C);
     });
 }
 
-void softmax_forward7(sycl::queue& queue, float* out, const float* inp, int N, int C, int block_size) {
+void softmax_forward7(float* out, const float* inp, int N, int C, int block_size) {
     int grid_size = N;
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel7(id, out, inp, N, C);
     });
 }
 
 // kernel version dispatch
-void softmax_forward(sycl::queue& queue, int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
+void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C, const int block_size) {
     switch (kernel_num) {
         case 1:
-            softmax_forward1(queue, out, inp, N, C, block_size);
+            softmax_forward1(out, inp, N, C, block_size);
             break;
         case 2:
-            softmax_forward2(queue, out, inp, N, C, block_size);
+            softmax_forward2(out, inp, N, C, block_size);
             break;
         case 3:
-            softmax_forward3(queue, out, inp, N, C, block_size);
+            softmax_forward3(out, inp, N, C, block_size);
             break;
         case 4:
-            softmax_forward4(queue, out, inp, N, C, block_size);
+            softmax_forward4(out, inp, N, C, block_size);
             break;
         case 5:
-            softmax_forward_online1(queue, out, inp, N, C, block_size);
+            softmax_forward_online1(out, inp, N, C, block_size);
             break;
         case 6:
-            softmax_forward_online2(queue, out, inp, N, C, block_size);
+            softmax_forward_online2(out, inp, N, C, block_size);
             break;
         case 7:
-            softmax_forward7(queue, out, inp, N, C, block_size);
+            softmax_forward7(out, inp, N, C, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -513,11 +513,13 @@ int main(int argc, char **argv) {
     sycl::queue defaultQueue(sycl::gpu_selector_v, 
                             {sycl::property::queue::in_order{},
                              sycl::property::queue::enable_profiling{}});
-
+    printf("Using device: %s\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Using Platform: %s\n", defaultQueue.get_device().get_platform().get_info<sycl::info::platform::name>().c_str());
     if (!defaultQueue.get_device().has(sycl::aspect::usm_device_allocations)) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
     }
+    DefaultQueue = &defaultQueue;
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * V * sizeof(float));
@@ -535,11 +537,8 @@ int main(int argc, char **argv) {
     // move to GPU
     float* d_out;
     float* d_inp;
-    d_out = sycl::malloc_device<float>(B * T * V, defaultQueue);
-    d_inp = sycl::malloc_device<float>(B * T * V, defaultQueue);
-
-    syclMallocCheck(d_out);
-    syclMallocCheck(d_inp);
+    syclMallocCheck(d_out = sycl::malloc_device<float>(B * T * V, defaultQueue));
+    syclMallocCheck(d_inp = sycl::malloc_device<float>(B * T * V, defaultQueue));
 
     defaultQueue.memcpy(d_inp, inp, B * T * V * sizeof(float));
 
@@ -567,9 +566,9 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        softmax_forward(defaultQueue, kernel_num, d_out, d_inp, B * T, V, block_size);
+        softmax_forward(kernel_num, d_out, d_inp, B * T, V, block_size);
         // Tweak tolerance for now b/c fp32
-        validate_result(defaultQueue, d_out, out, "out", B * T * V, 1e-3f);
+        validate_result(d_out, out, "out", B * T * V, 1e-3f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -579,7 +578,7 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 100;
-        float elapsed_time = benchmark_kernel(defaultQueue, repeat_times, softmax_forward,
+        float elapsed_time = benchmark_kernel(repeat_times, softmax_forward,
                                               kernel_num, d_out, d_inp, B * T, V, block_size);
 
         printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));

@@ -37,16 +37,15 @@ void residual_forward_kernel(sycl::nd_item<1> id, float* out, const float* inp1,
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void residual_forward1(sycl::queue &queue, float* out, const float* inp1, const float* inp2, int N, const int block_size) {
+void residual_forward1(float* out, const float* inp1, const float* inp2, int N, const int block_size) {
     const int grid_size = ceil_div(N, block_size);
-    queue.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
         residual_forward_kernel(id, out, inp1, inp2, N);
     });
 }
 
 // kernel version dispatch
-void residual_forward(sycl::queue &queue, 
-                  int kernel_num,
+void residual_forward(int kernel_num,
                   float* out,
                   const float* inp1,
                   const float* inp2,
@@ -54,7 +53,7 @@ void residual_forward(sycl::queue &queue,
                   int block_size) {
     switch (kernel_num) {
         case 1:
-            residual_forward1(queue, out, inp1, inp2, N, block_size);
+            residual_forward1(out, inp1, inp2, N, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -74,11 +73,13 @@ int main(int argc, char **argv) {
     sycl::queue defaultQueue(sycl::gpu_selector_v, 
                             {sycl::property::queue::in_order{},
                              sycl::property::queue::enable_profiling{}});
-
+    printf("Using device: %s\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Using Platform: %s\n", defaultQueue.get_device().get_platform().get_info<sycl::info::platform::name>().c_str());
     if (!defaultQueue.get_device().has(sycl::aspect::usm_device_allocations)) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
     }
+    DefaultQueue = &defaultQueue;
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -115,8 +116,8 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        residual_forward(defaultQueue, kernel_num, d_out, d_inp1, d_inp2, B * T * C, block_size);
-        validate_result(defaultQueue, d_out, out, "out", B * T * C, 1e-5f);
+        residual_forward(kernel_num, d_out, d_inp1, d_inp2, B * T * C, block_size);
+        validate_result(d_out, out, "out", B * T * C, 1e-5f);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -125,7 +126,7 @@ int main(int argc, char **argv) {
         int block_size = block_sizes[j];
 
         int repeat_times = 1000;
-        float elapsed_time = benchmark_kernel(defaultQueue, repeat_times, residual_forward,
+        float elapsed_time = benchmark_kernel(repeat_times, residual_forward,
                                               kernel_num, d_out, d_inp1, d_inp2, B * T * C, block_size
                                               );
 

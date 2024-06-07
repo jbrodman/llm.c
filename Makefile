@@ -22,6 +22,9 @@ NCLL_INCUDES =
 # because it bloats up the compile time from a few seconds to ~minute
 USE_CUDNN ?= 0
 
+# Override multi GPU
+NO_MULTI_GPU = 1
+
 # autodect a lot of various supports on current platform
 $(info ---------------------------------------------)
 
@@ -210,10 +213,10 @@ profile_gpt2cu: profile_gpt2.cu
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $< $(NVCC_LDFLAGS) $(CUDA_OUTPUT_FILE)
 
 train_gpt2sycl: train_gpt2.cpp
-	icpx -O3 -fsycl $< -ldnnl -o $@
+	icpx -O3 -fsycl $(PFLAGS) $< -ldnnl -o $@
 
 test_gpt2sycl: test_gpt2.cpp
-	icpx -O3 -fsycl $< -ldnnl -o $@
+	icpx -O3 -fsycl $(PFLAGS) $< -ldnnl -o $@
 
 clean:
 	$(REMOVE_FILES) $(TARGETS)

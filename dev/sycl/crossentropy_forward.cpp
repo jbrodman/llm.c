@@ -82,7 +82,7 @@ void crossentropy_forward(int kernel_num,
 // ----------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    srand(0);
+    setup_main();
 
     int B = 8;
     int T = 1024;
@@ -91,7 +91,8 @@ int main(int argc, char **argv) {
     sycl::queue defaultQueue(sycl::gpu_selector_v, 
                             {sycl::property::queue::in_order{},
                              sycl::property::queue::enable_profiling{}});
-
+    printf("Using device: %s\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
+    printf("Using Platform: %s\n", defaultQueue.get_device().get_platform().get_info<sycl::info::platform::name>().c_str());
     if (!defaultQueue.get_device().has(sycl::aspect::usm_device_allocations)) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
