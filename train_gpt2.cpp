@@ -150,6 +150,9 @@ EnableIfIsNonNativeOp<T, BinaryOperation> reduce_over_group(Group g, T x,
 
 // Make a global pointer to the SYCL queue to avoid passing it around
 sycl::queue *DefaultQueue = nullptr;
+// oneDNN engine and stream
+dnnl::engine *DefaultEngine = nullptr;
+dnnl::stream *DefaultStream = nullptr;
 
 #ifdef MULTI_GPU
 void nccl_check(ncclResult_t status, const char *file, int line) {
@@ -1124,8 +1127,8 @@ void matmul_forward_cublaslt(floatX* out,
     int has_bias = (bias != NULL);
 
     // Setup engine and stream
-    auto engine = dnnl::sycl_interop::make_engine(DefaultQueue->get_device(), DefaultQueue->get_context());
-    auto stream = dnnl::sycl_interop::make_stream(engine, *DefaultQueue);
+    auto &engine = *DefaultEngine;
+    auto &stream = *DefaultStream;
 
     // Create memory descriptors
     dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
@@ -1228,8 +1231,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     }
 
     // Setup engine and stream
-    auto engine = dnnlsycl::make_engine(DefaultQueue->get_device(), DefaultQueue->get_context());
-    auto stream = dnnlsycl::make_stream(engine, *DefaultQueue);
+    auto &engine = *DefaultEngine;
+    auto &stream = *DefaultStream;
 
     // Create memory descriptors
     auto q_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
@@ -1325,8 +1328,8 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
     float zero = 0.0f;
     // backward to input, uses = in the backward pass (set the gradient)
     // Setup engine and stream
-    auto engine = dnnlsycl::make_engine(queue.get_device(), queue.get_context());
-    auto stream = dnnlsycl::make_stream(engine, queue);
+    auto &engine = *DefaultEngine;
+    auto &stream = *DefaultStream;
 
     dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
     switch (PRECISION_MODE) {
@@ -1484,8 +1487,8 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
     // backward into datt
     // Batched matrix multiply with oneDNN
     // Setup engine and stream
-    auto engine = dnnlsycl::make_engine(DefaultQueue->get_device(), DefaultQueue->get_context());
-    auto stream = dnnlsycl::make_stream(engine, *DefaultQueue);
+    auto &engine = *DefaultEngine;
+    auto &stream = *DefaultStream;
 
     // Create memory descriptors
     auto scratch_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
@@ -2522,6 +2525,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     DefaultQueue = &defaultQueue;
+    // Setup oneDNN engine and stream
+    auto engine = dnnl::sycl_interop::make_engine(DefaultQueue->get_device(), DefaultQueue->get_context());
+    auto stream = dnnl::sycl_interop::make_stream(engine, *DefaultQueue);
+    DefaultEngine = &engine;
+    DefaultStream = &stream;
 
     // setup compute precision settings for cublas
     // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
