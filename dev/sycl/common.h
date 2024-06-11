@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <cmath>
 
+namespace syclx = sycl::ext::oneapi;
+
 // Random Globals
 sycl::queue* DefaultQueue = nullptr;
 
@@ -99,6 +101,27 @@ void store128cs(ElementType* target, Packed128<ElementType> value) {
     //__stcs(reinterpret_cast<int4*>(target), value.get_bits());
     *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
 }
+
+// ----------------------------------------------------------------------------
+// reduced/mixed precision utilities
+
+#if defined(ENABLE_BF16)
+
+typedef syclx::bfloat16 floatX;
+typedef syclx::bfloat16 floatN;
+
+#elif defined(ENABLE_FP16)
+
+typedef sycl::half floatX;
+typedef sycl::half floatN;
+
+#else
+
+typedef float floatX;
+typedef float floatN;
+#endif
+
+typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------
 // random utils

@@ -2,7 +2,7 @@
 Kernels for matmul backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward -lcublas
+nvcc -O3 --use_fast_math -lcublas -lcublasLt -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward
 
 OMP_NUM_THREADS=32 ./matmul_backward 1
 */
@@ -268,12 +268,14 @@ int main(int argc, char **argv) {
     free(dout);
     free(inp);
     free(weight);
+    free(ones);
     cudaCheck(cudaFree(d_dinp));
     cudaCheck(cudaFree(d_dweight));
     cudaCheck(cudaFree(d_dbias));
     cudaCheck(cudaFree(d_dout));
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_weight));
+    cudaCheck(cudaFree(d_ones));
     cublasCheck(cublasDestroy(cublas_handle));
 
     return 0;
