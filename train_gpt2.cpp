@@ -21,6 +21,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/dataloader.h"
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
+// defines: lr_scheduler_init, get_learning_rate
+#include "llmc/schedulers.h"
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
@@ -71,153 +73,15 @@ dnnl::stream *DefaultStream = nullptr;
 // defines: global_norm_squared
 #include "llmsycl/global_norm.hpp"
 // ----------- Multi-GPU support -----------
-#ifdef MULTI_GPU
-#include <mpi.h>
-#include <nccl.h>
-#endif
+#include "llmsycl/zero.hpp"
 
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
-// Multi-GPU related
-#ifdef MULTI_GPU
 
-#if defined(ENABLE_FP32)
-const ncclDataType_t ncclFloatX = ncclFloat;
-#elif defined(ENABLE_FP16)
-const ncclDataType_t ncclFloatX = ncclHalf;
-#else // Default to bfloat16
-const ncclDataType_t ncclFloatX = ncclBfloat16;
-#endif
-
-void nccl_check(ncclResult_t status, const char *file, int line) {
-    if (status != ncclSuccess) {
-        printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line, ncclGetErrorString(status));
-        exit(EXIT_FAILURE);
-    }
-}
-#define ncclCheck(err) (nccl_check(err, __FILE__, __LINE__))
-
-void mpi_check(int status, const char *file, int line) {
-    if (status != MPI_SUCCESS) {
-        char mpi_error[4096];
-        int mpi_error_len = 0;
-        assert(MPI_Error_string(status, &mpi_error[0], &mpi_error_len) == MPI_SUCCESS);
-        printf("[MPI ERROR] at file %s:%d:\n%.*s\n", file, line, mpi_error_len, mpi_error);
-        exit(EXIT_FAILURE);
-    }
-}
-#define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-
-#endif // MULTI_GPU
-
-// ----------------------------------------------------------------------------
-// MPI / multi-processing setup
-
-// Parameters specific to training on multiple GPUs.
-typedef struct {
-    int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
-    int num_processes;     // Total number of processes. 1 if no multi-GPU.
-    int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
-
-    // Zero Redundancy Optimizer stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
-    // 0-Disabled
-    // 1-Optimizer State Sharding (OSS)
-    // 2-Optimizer + Gradient State Sharding (SDP)
-    // 3-Optimizer + Gradient + Horizontal Model Sharding (FSDP)
-    int zero_stage;
-    size_t shard_num_parameters;
-    size_t shard_offset;
-#ifdef MULTI_GPU
-    ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
-#endif
-} MultiGpuConfig;
 
 // one global variable to hold the multi-GPU configuration for this process
 MultiGpuConfig multi_gpu_config;
-
-#ifdef MULTI_GPU
-// Determine which GPU this process should use.
-// Processes on the same machines use different GPU indicies. Processes on other machines don't.
-// Copied from NCCL examples: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/examples.html#example-2-one-device-per-process-or-thread
-int multi_gpu_get_local_device_idx(int process_rank, int num_processes) {
-  char hostname[1024];
-  hostname[1023] = '\0';
-  // All processes on the same machine will share the same hostname.
-  gethostname(hostname, 1023);
-  for (int i=0; i < 1024; i++) {
-    if (hostname[i] == '.') {
-        hostname[i] = '\0';
-        break;
-    }
-  }
-  uint64_t hostname_hash = 5381;
-  for (int c = 0; hostname[c] != '\0'; c++){ hostname_hash = ((hostname_hash << 5) + hostname_hash) ^ hostname[c]; }
-
-  // Distribute all hostname hashes to all processes.
-  uint64_t* all_hostsname_hashes = (uint64_t*)malloc(num_processes * sizeof(uint64_t));
-  all_hostsname_hashes[process_rank] = hostname_hash;
-  mpiCheck(MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, all_hostsname_hashes, sizeof(uint64_t), MPI_BYTE, MPI_COMM_WORLD));
-
-  // Identify which GPU we need to use.
-  int local_device_idx = 0;
-  for (int current_process = 0; current_process < num_processes; ++current_process) {
-     if (current_process == process_rank) {
-      // Found my gpu, local_device_idx now has my target GPU index.
-      break;
-     }
-     if (all_hostsname_hashes[current_process] == all_hostsname_hashes[process_rank]) {
-      // This process ID runs on the same machine, but it's not me, skip this GPU
-      local_device_idx++;
-     }
-  }
-
-  free(all_hostsname_hashes);
-  return local_device_idx;
-}
-#endif
-
-MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
-#ifdef MULTI_GPU
-    // Initialize MPI.
-    MultiGpuConfig result;
-    mpiCheck(MPI_Init(argc, argv));
-    mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &result.process_rank));
-    mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &result.num_processes));
-    result.local_device_idx = multi_gpu_get_local_device_idx(result.process_rank, result.num_processes);
-    cudaCheck(cudaSetDevice(result.local_device_idx));
-    ncclUniqueId nccl_id;
-    if (result.process_rank == 0) {
-        ncclCheck(ncclGetUniqueId(&nccl_id));
-    }
-    mpiCheck(MPI_Bcast((void *)&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
-    ncclCheck(ncclCommInitRank(&result.nccl_comm, result.num_processes, nccl_id, result.process_rank));
-    return result;
-#else
-    printf("Multi-GPU support is disabled. Using a single GPU.\n");
-    
-    MultiGpuConfig result;
-    result.process_rank = 0;
-    result.num_processes = 1;
-    result.local_device_idx = 0;
-    return result;
-#endif
-}
-
-void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    ncclCheck(ncclCommDestroy(multi_gpu_config->nccl_comm));
-    mpiCheck(MPI_Finalize());
-#endif
-}
-
-void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes > 1) {
-        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
-    }
-#endif
-}
 
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
@@ -230,11 +94,8 @@ void printf0(const char *format, ...) {
 }
 
 void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
-
     multi_gpu_config->zero_stage = 0;
     multi_gpu_config->shard_num_parameters = total_parameters;
-    multi_gpu_config->shard_offset = 0;
-
     // Check the Zero Stage and define sharding parameters
     if (zero_stage == 0) {
         printf0("| Zero Optimization is disabled                                              |\n");
@@ -248,7 +109,6 @@ void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t t
             printf0("| Zero Stage1 is enabled                                                     |\n");
             multi_gpu_config->zero_stage = 1;
             multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
-            multi_gpu_config->shard_offset = multi_gpu_config->process_rank * multi_gpu_config->shard_num_parameters;
         }
     }
     else{
@@ -343,7 +203,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 21
+constexpr int NUM_ACTIVATION_TENSORS = 23;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
@@ -372,6 +232,10 @@ typedef struct {
     // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
     // (B, NH, T, T), and (B, T, V) shaped tensors.
     floatX* output;
+
+    // some additional scratch buffers
+    floatX* scratch_bt4c;   // (B, T, 4*C)
+    floatX* scratch_btc;    // (B, T, C)
 } ActivationTensors;
 
 void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
@@ -408,34 +272,9 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     act_sizes[18] = B * T; // losses
     act_sizes[19] = L * B * T * 3*C; // qkvr
     act_sizes[20] = B * T * std::max(3*C, std::max(NH*T, Vp)); // output / scratch
-}
-
-// Backward pass is conceptually quite different from forward, because we can discard
-// the activations of a layer as soon as we're done with it. This lets us aggressively
-// reuse memory, so that we need far fewer tensors for backward state.
-#ifdef ENABLE_CUDNN
-#define NUM_BACKWARD_TENSORS 2
-#else
-#define NUM_BACKWARD_TENSORS 3
-#endif
-
-typedef struct {
-    floatX* bt4c; // (B, T, 4*C)
-    floatX* residual3; // (B, T, C)
-    #ifndef ENABLE_CUDNN
-    floatX* preatt; // (B, NH, T, T)
-    #endif
-} GradActTensors;
-
-void fill_in_grad_act_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
-    size_t C = config.channels;
-    act_sizes[0] = B * T * 4 * C; // bt4c
-    act_sizes[1] = B * T * C; // residual3
-
-    #ifndef ENABLE_CUDNN
-    size_t NH = config.num_heads;
-    act_sizes[2] = B * NH * T * T; // preatt
-    #endif
+    
+    act_sizes[21] = B * T * 4 * C;  // scratch_bt4c
+    act_sizes[22] = B * T * C;      // scratch_btc
 }
 
 void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
@@ -463,19 +302,10 @@ void* malloc_and_point_activations(ActivationTensors* acts, const size_t* act_si
         &acts->encoded, &acts->ln1, &acts->ln1_mean, &acts->ln1_rstd, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2, &acts->ln2_mean,
         &acts->ln2_rstd, &acts->fch, &acts->fch_gelu, &acts->fcproj, &acts->residual3, &acts->lnf,
-        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output
+        &acts->lnf_mean, &acts->lnf_rstd, &acts->losses, &acts->qkvr, &acts->output,
+        &acts->scratch_bt4c, &acts->scratch_btc
     };
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
-}
-
-void* malloc_and_point_backward(GradActTensors* acts, const size_t* act_sizes) {
-    floatX** ptrs[] = {
-        &acts->bt4c, &acts->residual3,
-        #ifndef ENABLE_CUDNN
-        &acts->preatt,
-        #endif
-    };
-    return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct {
@@ -499,10 +329,6 @@ typedef struct {
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     void* acts_memory;
     size_t num_activations;
-    // gradients of the activations
-    GradActTensors grads_acts;
-    size_t num_grad_acts;
-    void* grads_acts_memory;
     // other run state configuration
     int batch_size; // the batch size (B) of current forward pass
     int seq_len; // the sequence length (T) of current forward pass
@@ -517,7 +343,7 @@ typedef struct {
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
-    sycl::int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    sycl::int4* bucket_info; // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -535,9 +361,9 @@ void gpt2_init_common(GPT2 *model) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    model->params_memory = NULL;
     // memory lazily initialized in backward()
     model->grads_memory = NULL;
-    model->grads_acts_memory = NULL;
     model->workload_indices = NULL; // on cpu, for encoder_backward
     model->bucket_info = NULL; // on cpu, for encoder_backward
     // memory lazily initialized in update()
@@ -545,7 +371,7 @@ void gpt2_init_common(GPT2 *model) {
     model->v_memory = NULL;
     model->master_weights = NULL;
     // other default settings
-    model->rng_state = 13371337; // used in stochastic rounding
+    model->rng_state = 13371337 + multi_gpu_config.process_rank; // used in stochastic rounding
     model->use_master_weights = 1; // safe default: do keep master weights in fp32
     model->recompute = 1; // good default: recompute gelu but not layernorm
 }
@@ -630,6 +456,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     }
 
     // create memory for model parameters on the device
+    assert(model->params_memory == nullptr && "Old model needs to be freed before loading from checkpoint again");
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
@@ -639,7 +466,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    gpt2_init_common(model);
     // only return from this function once we are certain the params are ready on the GPU
     main_stream->wait();
 }
@@ -729,8 +555,6 @@ void gpt2_build_from_random(GPT2 *model, int depth) {
     // copy them to GPU
     main_stream->memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
     free(params_memory_cpu);
-
-    gpt2_init_common(model);
 }
 
 void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
@@ -771,8 +595,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, 
         // also create memory for caching inputs and targets
         syclMallocCheck(model->inputs = sycl::malloc_device<int>(B * T, *main_stream));
         syclMallocCheck(model->targets = sycl::malloc_device<int>(B * T, *main_stream));
-        syclMallocCheck(model->cpu_losses = sycl::malloc_host<floatX>(B * T, *main_stream));
-        syclMallocCheck(model->cpu_losses_fp32 = sycl::malloc_host<float>(B * T, *main_stream));
+        // Did this cause issues? 
+        // syclMallocCheck(model->cpu_losses = sycl::malloc_host<floatX>(B * T, *main_stream));
+        //syclMallocCheck(model->cpu_losses_fp32 = sycl::malloc_host<float>(B * T, *main_stream));
+        model->cpu_losses = (floatX*)mallocCheck(B*T*sizeof(floatX));
+        model->cpu_losses_fp32 = (float*)mallocCheck(B*T*sizeof(float));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -905,7 +732,7 @@ void gpt2_zero_grad(GPT2 *model) {
     main_stream->wait();
 }
 
-void gpt2_backward(GPT2 *model, int* inputs) {
+void gpt2_backward(GPT2 *model, int* inputs, bool last_step) {
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
@@ -918,17 +745,6 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // allocate buffers for weight gradients
         printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        // we're going to be clever for the activations backward pass. we don't need to exactly
-        // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
-        fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
-        // count up and allocate the space
-        model->num_grad_acts = 0;
-        for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
-            model->num_grad_acts += bw_act_sizes[i];
-        }
-        printf0("allocating %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
         // initialise cpu scratch buffers for encoder backward
@@ -950,10 +766,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     ParameterTensors params = model->params; // for brevity
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
-    GradActTensors grads_acts = model->grads_acts;
 
     // reset residual stream gradients (put here to work with gradient accumulation)
-    main_stream->memset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX));
+    floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
+    main_stream->memset(dresidual, 0, B * T * C * sizeof(floatX));
 
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
@@ -964,11 +780,10 @@ void gpt2_backward(GPT2 *model, int* inputs) {
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -1018,7 +833,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
+        floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
         if(model->recompute >= 1) {
@@ -1045,8 +860,7 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
-        floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
         if(model->recompute >= 2) {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
@@ -1055,9 +869,37 @@ void gpt2_backward(GPT2 *model, int* inputs) {
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        
+        // Accumulate gradients from this layer in a background stream.
+        if(last_step) {
+            floatX* const pointers[] = {
+                dl_ln1w, dl_ln1b,
+                dl_qkvw, dl_qkvb,
+                dl_attprojw, dl_attprojb,
+                dl_ln2w, dl_ln2b,
+                dl_fcw, dl_fcb,
+                dl_fcprojw, dl_fcprojb
+            };
+            const size_t nelem[] = {
+                C, C,
+                3 * C * C, 3 * C,
+                C * C, C,
+                C, C,
+                4 * C * C, 4 * C,
+                C * 4 * C, C
+            };
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    
+    // Aggregate all gradients that are not part of the transformer blocks
+    if(last_step) {
+        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+        const size_t nelem[] = {Vp * C, T * C, C, C};
+        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+    }
 
     main_stream->wait();
 }
@@ -1076,30 +918,32 @@ float multi_gpu_cpu_float_sum(float value) {
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
+void gpt2_multi_gpu_loss_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
     NVTX_RANGE_FN();
     // If there's only one process, there is nothing to do
     if (multi_gpu_config->num_processes == 1) { return; }
     // Average all losses.
     model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
-    // Now average the gradients
-    if(multi_gpu_config->zero_stage == 0) {
-        // no ZERO == standard DDP: Average all gradients.
-        ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
-                                model->num_parameters,
-                                ncclFloatX, ncclAvg,
-                                multi_gpu_config->nccl_comm, main_stream));
-    } else if (multi_gpu_config->zero_stage == 1) {
-        // ZERO-1: Get the average gradient only for local shard
-        floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
-        ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
-                                    multi_gpu_config->shard_num_parameters,
-                                    ncclFloatX, ncclAvg,
-                                    multi_gpu_config->nccl_comm, main_stream));
-    }
 #endif
     main_stream->wait();
+}
+
+// Gets the offset of a specific tensor for a specific layer in the GPT2 model
+// layer_id is ignored for weights that are not part of a transformer block
+ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_tensor_id) {
+    // first offset our way to the parameter tensor start
+    ptrdiff_t offset = 0;
+    for (int i = 0; i < param_tensor_id; i++) {
+        offset += (ptrdiff_t)model->param_elements[i];
+    }
+    size_t size = model->param_elements[param_tensor_id] ;
+    // if we are in the transformer block, we need to additionally offset by the layer id
+    if(2 <= param_tensor_id && param_tensor_id <= 13) {
+        size /= model->config.num_layers;
+        offset += (ptrdiff_t)(layer_id * size);
+    }
+    return {offset, size};
 }
 
 float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
@@ -1110,8 +954,6 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     // selectively weight decay some, but not all tensors :(
     // TODO: revisit and probably refactor this entire function
     size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
-    size_t shard_offset = multi_gpu_config->shard_offset; // offset into the full parameter tensor
-    floatX* params_memory = (floatX*)model->params_memory;
     floatX* grads_memory = (floatX*)model->grads_memory;
 
     // lazily allocate m,v memory and master weights (usually on the first iteration)
@@ -1123,36 +965,48 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
         main_stream->memset(model->m_memory, 0, shard_num_parameters * sizeof(float));
         main_stream->memset(model->v_memory, 0, shard_num_parameters * sizeof(float));
     }
+
+    bool init_master_weights = false;
     if (model->use_master_weights == 1 && model->master_weights == NULL) {
         printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
         syclMallocCheck(model->master_weights = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
-        size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
-        float* master_ptr = (float*)model->master_weights;
-        floatX* params_ptr = params_memory + shard_offset;
-        main_stream->parallel_for(sycl::nd_range<1>(grid_size * 512, 512), [=](sycl::nd_item<1> id) {
-            copy_and_cast_kernel(id, master_ptr, params_ptr, shard_num_parameters);
-        });
+        init_master_weights = true;
     }
 
     // gradient clipping
     // repurposing this buffer (which isn't needed now) to write grad norm into it
     float* grad_norm_squared = (float*)model->acts.output;
-    if (multi_gpu_config->zero_stage == 1) {
-        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
-        // grads_memory only contains the averaged gradients at the local shard
-        // so we only calculate the grad norm at the grads_memory belonging to the local shard
-        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters, main_stream);
-    } else {
-        // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
-        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
-        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, main_stream);
-    }
-    // transfer the gradient norm to CPU
     float grad_norm_squared_cpu = 0.0f;
-    main_stream->memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float)).wait();
+
+    int num_slices[2] = {1, model->config.num_layers};
+    int max_num_block_sums = get_max_num_block_sums(num_slices, 2);
     if (multi_gpu_config->zero_stage == 1) {
+        // because of the ncclReduceScatter() in backward,
+        // grads_memory only contains the averaged gradients at the local shards,
+        // so we only calculate the grad norm at the grads_memory belonging to the local shards
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+            ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+            ptrdiff_t offset = tensor.offset + shard.offset;
+            bool is_first_pass = (i == 0);
+            if((i < 2 || i > 13)) {
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, 0, 1,
+                                    max_num_block_sums, is_first_pass, main_stream);
+            } else {
+                global_norm_squared(grad_norm_squared, grads_memory + offset, shard.size, tensor.size, model->config.num_layers,
+                                    max_num_block_sums, is_first_pass, main_stream);
+            }
+        }
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
+        main_stream->memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float)).wait();
         // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
         grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    } else {
+        // in regular DDP, backward has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
+        global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
+        main_stream->memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float)).wait();
     }
 
     if(!isfinite(grad_norm_squared_cpu)) {
@@ -1165,81 +1019,69 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
 
     // AdamW update
-    unsigned int seed = random_u32(&model->rng_state);
-    // individually call the adamw_kernel3 on all parameter tensors separately
-    size_t offset = 0;
+    
+    // handle adamw for all the transformer blocks
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        size_t num_parameters = model->param_elements[i];
-        // the scope of this GPU's work is the range: [shard_offset, shard_offset + shard_num_parameters)
-        // this parameter's values are in the range:  [offset, offset + num_parameters)
-        // so we are responsible for some of its parameters if:
-        // 1) this parameter ends after we begin (i.e. offset + num_parameters > shard_offset)
-        // 2) this parameter begins before we end (i.e. offset < shard_offset + shard_num_parameters)
-        if(offset + num_parameters > shard_offset && offset < shard_offset + shard_num_parameters) {
+        // generate a unique seed for each tensor
+        unsigned int seed = random_u32(&model->rng_state);
 
-            // ok this tensor has at least one element inside the range of responsibility of this GPU
-            // let's figure out the exact span we wish to call the AdamW kernel on
-            floatX* params_ptr = NULL;
-            floatX* grad_ptr = NULL;
-            float* m_ptr = NULL;
-            float* v_ptr = NULL;
-            float* master_ptr = NULL;
-            size_t local_params = 0;
-            // does the tensor begin before our responsibility?
-            if(offset <= shard_offset) {
-                // if so, our start point is exactly that of our responsibility, i.e. shard_offset
-                params_ptr = params_memory + shard_offset;
-                grad_ptr = grads_memory + shard_offset;
-                // note that (master_weights, m, v) are already only the "local slice" for this GPU,
-                // and are of size shard_num_parameters, instead of the total number of parameters
-                // so they do not get offset, i.e. we just start at their index 0
-                if (model->master_weights != NULL) { master_ptr = model->master_weights; }
-                m_ptr = model->m_memory;
-                v_ptr = model->v_memory;
-                // the number of parameters we have to update is the minimum of two ranges
-                local_params = std::min(shard_num_parameters, (offset + num_parameters) - shard_offset);
-            } else {
-                // our start point is the location of this tensor, i.e. offset
-                params_ptr = params_memory + offset;
-                grad_ptr = grads_memory + offset;
-                // this arithmetic gave me a headache but my little doodle example says it's right
-                size_t delta = offset - shard_offset;
-                if (model->master_weights != NULL) { master_ptr = model->master_weights + delta; }
-                m_ptr = model->m_memory + delta;
-                v_ptr = model->v_memory + delta;
-                local_params = std::min(num_parameters, shard_num_parameters - delta);
-            }
-            // we only want to weight decay the 2D tensors and leave all 1D tensors alone
-            // in particular this also decays the embedding weights, but this is ok:
-            // - the token embeddings are weight shared and participate in the final projection to logits
-            // - the position embeddings actively participate at every forward/backward pass
-            float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
-            // ok finally call the kernel
-            adamw_update(params_ptr, master_ptr, grad_ptr,
-                         m_ptr, v_ptr, local_params, learning_rate,
-                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        int num_layers = model->config.num_layers;
+        if((i < 2 || i > 13)) {
+            num_layers = 1;
         }
-        // advance the offset pointer to the next parameter tensor
-        offset += num_parameters;
+
+        ShardInfo tensor = gpt2_get_tensor_at_layer(model, 0, i);
+        ShardInfo shard = multi_gpu_get_shard_offset(tensor.size, multi_gpu_config, 1);
+        ptrdiff_t local_offset_full = tensor.offset + shard.offset;
+        ptrdiff_t local_offset_partial = tensor.offset / multi_gpu_config->num_processes;
+  
+        // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+        // in particular this also decays the embedding weights, but this is ok:
+        // - the token embeddings are weight shared and participate in the final projection to logits
+        // - the position embeddings actively participate at every forward/backward pass
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
+        floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
+
+        ptrdiff_t opt_state_offset = multi_gpu_config->zero_stage < 1 ?  local_offset_full : local_offset_partial;
+        float* m_ptr = model->m_memory + opt_state_offset;
+        float* v_ptr = model->v_memory + opt_state_offset;
+        float* master_ptr = NULL;
+        if (model->master_weights != NULL) { master_ptr = model->master_weights + opt_state_offset; }
+        if(init_master_weights) {
+            size_t grid_size = CEIL_DIV(shard.size, 512);
+            sycl::range<2> grid_dim(num_layers, grid_size);
+            sycl::range<2> block_dim(1, 512);
+            main_stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+                copy_and_cast_kernel(id, master_ptr, param_ptr, shard.size, shard.size, tensor.size);
+            });
+        }
+        
+        // ok finally call the kernel
+        adamw_update(param_ptr, master_ptr, grad_ptr,
+                     m_ptr, v_ptr,
+                     shard.size, tensor.size, tensor.size, shard.size, num_layers,
+                     learning_rate,
+                     beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+
+
+        if (multi_gpu_config->zero_stage == 1) {
+#if MULTI_GPU
+        ncclCheck(ncclGroupStart());
+        for(int l = 0; l < num_layers; ++l) {
+            // gather updated shards of model->params_memory from each process
+            ncclCheck(ncclAllGather(param_ptr + l * tensor.size,
+                                    (floatX*) model->params_memory + tensor.offset + l * tensor.size,
+                                    shard.size, ncclFloatX,
+                                    multi_gpu_config->nccl_comm, multi_gpu_config->nccl_stream));
+        }
+        ncclCheck(ncclGroupEnd());
+#endif
+        }
     }
 
     main_stream->wait();
     return grad_norm_cpu;
-}
-
-void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
-{
-#ifdef MULTI_GPU
-    if (multi_gpu_config->num_processes == 1) { return; } // 1 process => noop
-    if (multi_gpu_config->zero_stage == 1) {
-        // gather updated shards of model->params_memory from each process
-        ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
-                                multi_gpu_config->shard_num_parameters, ncclFloatX,
-                                multi_gpu_config->nccl_comm, main_stream));
-    }
-    cudaCheck(cudaGetLastError());
-#endif
-    main_stream->wait();
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
@@ -1278,11 +1120,12 @@ void gpt2_free(GPT2 *model) {
     sycl::free(model->v_memory, *main_stream);
     sycl::free(model->master_weights, *main_stream);
     sycl::free(model->acts_memory, *main_stream);
-    sycl::free(model->grads_acts_memory, *main_stream);
     sycl::free(model->inputs, *main_stream);
     sycl::free(model->targets, *main_stream);
-    sycl::free(model->cpu_losses, *main_stream);
-    sycl::free(model->cpu_losses_fp32, *main_stream);    
+    // sycl::free(model->cpu_losses, *main_stream);
+    // sycl::free(model->cpu_losses_fp32, *main_stream);    
+    free(model->cpu_losses);
+    free(model->cpu_losses_fp32);
     free(model->workload_indices);
     free(model->bucket_info);
 }
@@ -1322,13 +1165,6 @@ void common_free(GPT2 &model) {
     #endif
 }
 
-#ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
-
-// ----------------------------------------------------------------------------
-// training resumption logic, very useful when jobs crash once in a while
-// the goal is that we can resume optimization from any checkpoint, bit-perfect
-// note that "state" refers to things not already saved in the model checkpoint file
 
 void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
     printf("Writing state to %s\n", filename);
@@ -1340,14 +1176,17 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[1] = 1; // version number
     state_header[2] = multi_gpu_config.num_processes; // number of processes
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
+    state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
-    // model state, state, start at 20 to leave some padding
+    // model rng state, start at 20 to leave some padding
     *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
     // dataloader state, start at 30 to leave some padding
-    state_header[30] = loader->current_shard; // shard of the dataset
-    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    *((size_t*)&state_header[30]) = loader->current_shard_idx; // shard of the dataset
+    *((size_t*)&state_header[32]) = loader->current_sample_idx; // position in shard
     fwrite(state_header, sizeof(int), 256, state_file);
+
     // write AdamW m, v, and master_weights here (they are all float)
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
@@ -1355,7 +1194,20 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
     main_stream->memcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float)).wait();
     fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    if (model->use_master_weights == 1) {
+        main_stream->memcpy(cpu_buffer, model->master_weights, shard_num_parameters * sizeof(float)).wait();
+        fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    }
     free(cpu_buffer);
+
+    // write dataloader state if we are using the Permuted version of it
+    if (loader->should_shuffle) {
+        fwrite(&loader->glob_result.gl_pathc, sizeof(size_t), 1, state_file);  // number of shards
+        fwrite(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        fwrite(&loader->shard_num_samples, sizeof(size_t), 1, state_file);
+        fwrite(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        fwrite(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
     fclose(state_file);
 }
 
@@ -1367,32 +1219,77 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     assert(state_header[1] == 1); // version number
     assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
     assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    int use_master_weights = state_header[4];  // whether we're using fp32 master weights
+    int should_shuffle = state_header[5]; // shuffle state of the dataloader
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
-    int current_shard = state_header[30]; // shard of the dataset
-    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
-    dataloader_resume(loader, current_shard, current_position);
-    // read AdamW m, v (they are all float)
-    // also allocate the m, v memory in the model, if it does not yet exist
+    size_t current_shard_idx = *((size_t*)&state_header[30]); // shard index
+    size_t current_sample_idx = *((size_t*)&state_header[32]); // position in shard
+
+    // read AdamW m, v, master_weights (they are all float)
+    // allocate all the needed memory as necessary
     size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
     if (model->m_memory == NULL) {
         printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
-        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         syclMallocCheck(model->m_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+    }
+    if (model->v_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
         syclMallocCheck(model->v_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+    }
+    if (model->master_weights == NULL && use_master_weights == 1) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        syclMallocCheck(model->master_weights = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
     }
     float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    main_stream->memcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float));
+    main_stream->memcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float)).wait();
     freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
-    main_stream->memcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float));
+    main_stream->memcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float)).wait();
+    if (use_master_weights == 1) {
+        freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+        main_stream->memcpy(model->master_weights, cpu_buffer, shard_num_parameters * sizeof(float)).wait();
+    }
     free(cpu_buffer);
+    
+    // revive the DataLoader object and its state
+    loader->should_shuffle = should_shuffle;
+    if (should_shuffle == 1) {
+        // ensure the number of shards matches
+        size_t glob_result_gl_pathc;
+        freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
+        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+        // read the shard indices
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        // ensure the number of samples matches
+        size_t shard_num_samples;
+        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
+        assert(shard_num_samples == loader->shard_num_samples);
+        // read the intra-shard indices
+        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
+        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // read the shuffle rng state
+        freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
+    }
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
+
+    // all done, close state file
     fclose(state_file);
 }
 
+
+#ifndef TESTING
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
+
+// ----------------------------------------------------------------------------
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
+
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
-// unclaimed flags lol: k,p
+// unclaimed flags lol: p
 
 void error_usage() {
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
@@ -1411,6 +1308,7 @@ void error_usage() {
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
     // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
     fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
     fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
@@ -1441,6 +1339,7 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* lr_scheduler_type = "cosine";
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write optimization checkpoints every how many steps?
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
@@ -1491,18 +1390,13 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else { error_usage(); }
     }
     // should do a bit more error checking here
     assert(warmup_iterations >= 0);
     if (output_log_dir != NULL) {
         assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
-    }
-    // check if output_log_dir does not exist or is a file
-    struct stat info;
-    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
-        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
-        exit(EXIT_FAILURE);
     }
     int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
     // calculate sensible default for total batch size as assuming no gradient accumulation
@@ -1524,6 +1418,7 @@ int main(int argc, char *argv[]) {
     printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
     printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| LR scheduler          | %-50s |\n", lr_scheduler_type);
     printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
     printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
     printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
@@ -1580,6 +1475,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model
     GPT2 model;
+    gpt2_init_common(&model);
     // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
     // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
     // this variable as a checkpoint filename, and load that checkpoint
@@ -1611,8 +1507,8 @@ int main(int argc, char *argv[]) {
 
     // build DataLoaders for both train and val
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
-    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
     if (train_num_batches == -1) {
@@ -1671,6 +1567,11 @@ int main(int argc, char *argv[]) {
     // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+
+    // set up learning rate scheduler
+    LearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);
 
     // some memory for generating samples from the model
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
@@ -1822,28 +1723,17 @@ int main(int argc, char *argv[]) {
             gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
             lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
             // backward pass. all model params accumulate gradients with += inside this inner loop
-            gpt2_backward(&model, train_loader.inputs);
+            gpt2_backward(&model, train_loader.inputs, micro_step == grad_accum_steps - 1);
         }
         // override the mean loss, accounting for the gradient accumulation loop
         // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
         model.mean_loss = lossf;
         // average the loss and the gradients between all processes
-        gpt2_multi_gpu_loss_and_grad_reduce(&model, &multi_gpu_config);
-        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
-        float step_learning_rate = learning_rate;
-        if (step < warmup_iterations) {
-            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
-        } else {
-            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
-            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
-            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
-            assert(0.0f <= coeff && coeff <= 1.0f);
-            float min_lr = learning_rate * final_learning_rate_frac;
-            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
-        }
+        gpt2_multi_gpu_loss_reduce(&model, &multi_gpu_config);
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);
         // update the model parameters
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
-        gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
         // queue wait

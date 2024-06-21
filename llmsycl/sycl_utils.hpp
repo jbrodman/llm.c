@@ -137,11 +137,11 @@ float cast_value<float, syclx::bfloat16>(syclx::bfloat16 val) {
 }
 
 template<typename Td, typename Ts>
-void copy_and_cast_kernel(sycl::nd_item<1> id, Td* dst, const Ts* src, size_t n) {
-    int idx = id.get_global_id(0);
+void copy_and_cast_kernel(sycl::nd_item<2> id, Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
+    int idx = id.get_group(1) * id.get_local_range(1) + id.get_local_id(1);
     // need to try grid stride looping for more perf later
     if (idx < n) {
-        dst[idx] = cast_value<Td, Ts>(src[idx]);
+        dst[idx + stride_dst * id.get_group(0)] = cast_value<Td, Ts>(src[idx + stride_src * id.get_group(0)]);
     }
 }
 
@@ -200,22 +200,6 @@ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
     return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
 }
 
-// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, syclx::bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(id.get_local_id(0), id.get_group(0), seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits =  *reinterpret_cast<unsigned int*>(&in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = syclx::bfloat16(*reinterpret_cast<float*>(&float_bits));
-}
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, sycl::half *out, unsigned int random) {
-    *out = (float)in; // todo - implement this...
-}
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, float *out, unsigned int random) {
-    *out = in; // dummy function for when floatX is float (FP32 mode)
-}
 
 // ----------------------------------------------------------------------------
 // CUDA indexing helper functions
@@ -495,6 +479,23 @@ unsigned int atomicCAS(unsigned int* addr, unsigned int compare, unsigned int va
                      sycl::memory_scope::device> ref(*addr);
     ref.compare_exchange_strong(compare, val);
     return compare;
+}
+
+// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
+inline void stochastic_rounding(sycl::nd_item<2> id, float in, syclx::bfloat16 *out, unsigned int seed) {
+    // todo - is this stochastic rounding *too good*? can we cut any corners?
+    unsigned int random = Get2dNoiseUint(threadIdx_x(id), blockIdx_x(id) * blockDim_x(id) + blockIdx_y(id), seed);
+    unsigned int threshold = random & 0xFFFF;
+    unsigned int float_bits =  *reinterpret_cast<unsigned int*>(&in);
+    unsigned int rounded_bits = float_bits & 0x0000FFFF;
+    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
+    *out = syclx::bfloat16(*reinterpret_cast<float*>(&float_bits));
+}
+inline void stochastic_rounding(sycl::nd_item<2> id, float in, sycl::half *out, unsigned int random) {
+    *out = (float)in; // todo - implement this...
+}
+inline void stochastic_rounding(sycl::nd_item<2> id, float in, float *out, unsigned int random) {
+    *out = in; // dummy function for when floatX is float (FP32 mode)
 }
 
 #endif

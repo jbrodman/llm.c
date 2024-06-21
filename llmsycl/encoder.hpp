@@ -44,7 +44,7 @@ void encoder_forward_kernel3(sycl::nd_item<1> id, floatX* out,
 }
 
 template <int BLOCK_SIZE=256>
-void wte_backward_kernel(sycl::nd_item<1> id, floatX* dwte,
+void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
                                     const sycl::int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
                                     unsigned int seed, int B, int T, int C,
                                     sycl::local_accessor<float> lmem) {
@@ -113,13 +113,16 @@ void wte_backward_kernel(sycl::nd_item<1> id, floatX* dwte,
 
     // Add the result to dwte and write back to global memory (read-modify-write)
     for (unsigned int k = 0; k < x128::size; k++) {
-        // We use stochastic rounding to go from FP32 to BF16 but the seed should be deterministic
+        // We use stochastic rounding to go from FP32 to BF16
+        // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+        // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+        // and that somehow messing the quality of random numbers
         stochastic_rounding(id, accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
     }
     store128(dwte_ix, packed_in_out);
 }
 
-void wpe_backward_kernel(sycl::nd_item<1> id, floatX* dwpe,
+void wpe_backward_kernel(sycl::nd_item<2> id, floatX* dwpe,
                                     const floatX* dout, const int* inp,
                                     int B, int T, int C, unsigned int seed) {
     // Each thread handles x128::size "channel positions", e.g. 256 per warp for BF16
@@ -175,7 +178,9 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     const int block_size = 256;
     const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
-     stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    sycl::range<2> grid_dim(1, grid_size);
+    sycl::range<2> block_dim(1, block_size);
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
         wpe_backward_kernel(id, dwpe, dout, inp, B, T, C, seed);
     });
 
@@ -231,7 +236,9 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
     stream->submit([&](sycl::handler& h) {
         sycl::local_accessor<float> lmem(sycl::range<1>(256 * x128::size), h);
-        h.parallel_for(sycl::nd_range<1>(num_buckets*256, 256), [=](sycl::nd_item<1> id) {
+        sycl::range<2> grid_dim(1, num_buckets);
+        sycl::range<2> block_dim(1, 256);
+        h.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
            wte_backward_kernel<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
         });
     });

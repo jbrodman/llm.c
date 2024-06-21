@@ -151,7 +151,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, floatX* out, float inv_tempera
     }
 }
 
-void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id, floatX* dpreatt, const floatX* datt, const floatX* att,
+void softmax_autoregressive_backward_inplace_kernel(sycl::nd_item<2> id, floatX* datt, const floatX* att,
                                                        int B, int T, int C, float scale) {
     constexpr const int BlockSize = 256;
     constexpr int T_per_block = 4;
@@ -164,14 +164,13 @@ void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id, floatX* dpreatt
 
     att += idx * T * T;
     datt += idx * T * T;
-    dpreatt += idx * T * T;
 
     for(int to = 0; to < T_per_block; ++to) {
         int t = t0 - to;
         if(t < 0) return;
         const floatX* att_bth = att + t * T;
         const floatX* datt_bth = datt + t * T;
-        floatX* dpreatt_bth = dpreatt + t * T;
+        floatX* dpreatt_bth = datt + t * T;
 
         float local_sum = 0;
         for (int t2 = threadIdx_x(id); t2 <= t; t2 += BlockSize) {
@@ -180,11 +179,16 @@ void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id, floatX* dpreatt
 
         local_sum = sycl::reduce_over_group(block, local_sum, sycl::plus<float>());
 
-        for (int t3 = threadIdx_x(id); t3 <= t; t3 += BlockSize) {
+        for (int t3 = threadIdx_x(id); t3 < T; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
-            float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
+            if(t3 <= t) {
+                float acc = (float) __ldcs(att_bth + t3) * ((float) __ldcs(datt_bth + t3) - local_sum);
+                __stcs(dpreatt_bth + t3, (floatX) (scale * acc));
+            } else {
+                // explicitly set non-causal elements to zero
+                __stcs(dpreatt_bth + t3, (floatX)0.f);
+            }
         }
     }
 }
@@ -203,7 +207,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int HS = C / NH; // head size
+    const int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
     floatX *q, *k, *v;
@@ -263,7 +267,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     });
 
     // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
+    float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
     stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
         softmax_forward_kernel5(id, att, scale, preatt, B * NH, T);
@@ -305,12 +309,12 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
+void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
                         int B, int T, int C, int NH, sycl::queue* stream) {
     const int block_size = 256;
-    int HS = C / NH; // head size
+    const int HS = C / NH; // head size
     const float alpha = 1.0f, beta = 0.0f;
     dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
     switch (PRECISION_MODE) {
@@ -396,13 +400,13 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* da
         {DNNL_ARG_DST, dv_mem}
     });
 
-    // backward into preatt
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
+    const float scale = 1.0f / sqrtf((float)HS);
+    // backward into preatt. this is an in-place operation; datt turns into dpreatt here
     stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(B * NH, (T / 4) * 256),
                                                  sycl::range<2>(1, 256)), [=](sycl::nd_item<2> id) {
-        softmax_autoregressive_backward_kernel(id, dpreatt, datt, att, B, T, C, scale);
+        softmax_autoregressive_backward_inplace_kernel(id, datt, att, B, T, C, scale);
     });
+    floatX* dpreatt = datt;
     // backward into q
     auto dpreatt_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::abc);  
     auto k_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
