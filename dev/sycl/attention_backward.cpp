@@ -279,7 +279,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     // uses the online softmax algorithm
     assert(T % 4  == 0);
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int idx = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
     if(idx >= N * T) {
         return;
     }
@@ -294,7 +294,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     float sumval = 0.0f;
 
     const sycl::float4* x_vec = reinterpret_cast<const sycl::float4*>(x);
-    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i < pos_by_4; i += size(warp)) {
         sycl::float4 v = x_vec[i];
         float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
@@ -306,11 +306,11 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
         }
     }
 
-    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+    if(4*pos_by_4 + thread_rank(warp) <= own_pos) {
         float old_maxval = maxval;
-        maxval = sycl::fmax(maxval, x[4*pos_by_4 + warp.get_local_linear_id()]);
+        maxval = sycl::fmax(maxval, x[4*pos_by_4 + thread_rank(warp)]);
         sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
-        sumval += sycl::exp(inv_temperature * (x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+        sumval += sycl::exp(inv_temperature * (x[4*pos_by_4 + thread_rank(warp)] - maxval));
     }
 
     float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>{});
@@ -320,7 +320,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i <= own_pos; i += size(warp)) {
         // recalculation is faster than doing the round-trip through memory.
         // Fix this later
         // float ev = sycl::exp(inv_temperature * (__ldcs(x + i) - global_maxval));
@@ -370,7 +370,7 @@ void softmax_autoregressive_backward_kernel2(sycl::nd_item<2> id,
                                              float* dpreatt, const float* datt, const float* att,
                                              int B, int T, int C, int NH) {
     int t3 = id.get_global_id(1);
-    int idx = id.get_group(0) * T * T;
+    int idx = blockIdx_y(id) * T * T;
     if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
@@ -396,9 +396,9 @@ void softmax_autoregressive_backward_kernel3(sycl::nd_item<2> id,
                                              float* dpreatt, const float* datt, const float* att,
                                              int B, int T, int C, int NH) {
     sycl::sub_group warp = id.get_sub_group();
-    int t3 = id.get_group(1) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int t3 = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
 
-    int idx = id.get_group(0) * T * T;
+    int idx = blockIdx_y(id) * T * T;
     if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
@@ -410,7 +410,7 @@ void softmax_autoregressive_backward_kernel3(sycl::nd_item<2> id,
         float* dpreatt_bth = dpreatt + idx + t*T;
         const float att_at_t3 = att_bth[t3];
 
-        for (int t2 = warp.get_local_linear_id(); t2 <= t; t2 += warp.get_max_local_range()[0]) {
+        for (int t2 = thread_rank(warp); t2 <= t; t2 += size(warp)) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_bth[t2] * (indicator - att_at_t3);
             result += local_derivative * datt_bth[t2];
@@ -428,7 +428,7 @@ void softmax_autoregressive_backward_kernel4(sycl::nd_item<2> id,
                                              int B, int T, int C, int NH) {
     constexpr int UNROLL = 8;
     sycl::sub_group warp = id.get_sub_group();
-    int t3 = UNROLL * (id.get_group(1) * warp.get_group_linear_range() + warp.get_group_linear_id());
+    int t3 = UNROLL * (blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp));
 
     int idx = id.get_group(0) * T * T;
     if (t3 >= T) { return; }
@@ -472,7 +472,7 @@ void softmax_autoregressive_backward_kernel4(sycl::nd_item<2> id,
             result[k] = sycl::reduce_over_group(warp, result[k], sycl::plus<float>());
         }
         if (warp.get_local_linear_id() < UNROLL) {
-            dpreatt_bth[t3 + warp.get_local_linear_id()] = scale * result[warp.get_local_linear_id()];
+            dpreatt_bth[t3 + thread_rank(warp)] = scale * result[thread_rank(warp)];
         }
     }
 }
@@ -483,9 +483,9 @@ void softmax_autoregressive_backward_kernel5(sycl::nd_item<2> id,
                                              int B, int T, int C, int NH) {
     constexpr int UNROLL = 8;
     sycl::sub_group warp = id.get_sub_group();
-    int t3 = UNROLL * (id.get_group(1) * warp.get_group_linear_range() + warp.get_group_linear_id());
+    int t3 = UNROLL * (blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp));
 
-    int idx = id.get_group(0) * T * T;
+    int idx = blockIdx_y(id) * T * T;
     if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
@@ -526,10 +526,10 @@ void softmax_autoregressive_backward_kernel5(sycl::nd_item<2> id,
             // declare the loop iterator. Needs to be kept across the
             // three different parts, so it's not a local variable in
             // the for loop.
-            int t2 = warp.get_local_linear_id();
+            int t2 = thread_rank(warp);
 
             // first part, as long as t2 < t3, indicator == 0
-            for (; t2 < t3; t2 += warp.get_max_local_range()[0]) {
+            for (; t2 < t3; t2 += size(warp)) {
                 loop_step(t2);
             }
 
@@ -544,11 +544,11 @@ void softmax_autoregressive_backward_kernel5(sycl::nd_item<2> id,
                     float indicator = t2 == (t3 + k) ? 1.0f : 0.0f;
                     result[k] += p * (indicator - att_at_t3[k]);
                 }
-                t2 += warp.get_max_local_range()[0];
+                t2 += size(warp);
             }
 
             // rest of the loop, indicator == 0 again
-            for (; t2 <= t; t2 += warp.get_max_local_range()[0]) {
+            for (; t2 <= t; t2 += size(warp)) {
                 loop_step(t2);
             }
         }
@@ -559,8 +559,8 @@ void softmax_autoregressive_backward_kernel5(sycl::nd_item<2> id,
 
         // when storing, we need to check that this is actually a valid result.
         // here, warp.thread_rank() corresponds to `k` in the previous loops.
-        if (warp.get_local_linear_id() < UNROLL && t >= t3 + warp.get_local_linear_id()) {
-            dpreatt_bth[t3 + warp.get_local_linear_id()] = scale * result[warp.get_local_linear_id()];
+        if (thread_rank(warp) < UNROLL && t >= t3 + thread_rank(warp)) {
+            dpreatt_bth[t3 + thread_rank(warp)] = scale * result[thread_rank(warp)];
         }
     }
 }
@@ -590,8 +590,8 @@ void softmax_autoregressive_backward_kernel6(sycl::nd_item<2> id,
     sycl::group block = id.get_group();
     float* att_bth_s = (float*) lmem.get_raw();
 
-    int idx = id.get_group(0);
-    int t = id.get_group(1);
+    int idx = blockIdx_y(id);
+    int t = blockIdx_x(id);
 
     att += idx * T * T;
     datt += idx * T * T;
@@ -608,14 +608,14 @@ void softmax_autoregressive_backward_kernel6(sycl::nd_item<2> id,
     // even if a thread later on is not going to do any work, it needs to participate in the
     // data loading process!
     for (int t3f = 0; t3f < block_steps; ++t3f) {
-        int t3 = t3f * BlockSize + block.get_local_linear_id();
+        int t3 = t3f * BlockSize + thread_rank(block);
         float acc = 0.f;
         float at3 = att_bth[t3];
         for (int t2b = 0; t2b <= t; t2b += BlockSize) {
             int end = sycl::min(t + 1 - t2b, BlockSize);
             sycl::group_barrier(block);
             {
-                int t2i = block.get_local_linear_id();
+                int t2i = thread_rank(block);
                 int t2 = sycl::min(t, t2b + t2i);
                 att_bth_s[t2i] = att_bth[t2] * datt_bth[t2];
             }
@@ -644,8 +644,8 @@ void softmax_autoregressive_backward_kernel7(sycl::nd_item<2> id,
                                              float* dpreatt, const float* datt, const float* att,
                                              int B, int T, int C, float scale) {
     sycl::group block = id.get_group();
-    int idx = id.get_group(0);
-    int t = id.get_group(1);
+    int idx = blockIdx_y(id);
+    int t = blockIdx_x(id);
 
     att += idx * T * T;
     datt += idx * T * T;
@@ -656,7 +656,7 @@ void softmax_autoregressive_backward_kernel7(sycl::nd_item<2> id,
     float* dpreatt_bth = dpreatt + t * T;
 
     float local_sum = 0;
-    for(int t2 = block.get_local_linear_id(); t2 <= t; t2 += BlockSize) {
+    for(int t2 = thread_rank(block); t2 <= t; t2 += BlockSize) {
         local_sum += att_bth[t2] * datt_bth[t2];
     }
     
@@ -667,7 +667,7 @@ void softmax_autoregressive_backward_kernel7(sycl::nd_item<2> id,
     local_sum = sycl::reduce_over_group(warp, block_acc[warp.get_local_linear_id()], sycl::plus<float>());
     */
 
-    for (int t3 = block.get_local_linear_id(); t3 <= t; t3 += BlockSize) {
+    for (int t3 = thread_rank(block); t3 <= t; t3 += BlockSize) {
         float acc = att_bth[t3] * (datt_bth[t3] - local_sum);
         dpreatt_bth[t3] = scale * acc;
     }
@@ -687,7 +687,7 @@ void softmax_autoregressive_backward_kernel8(sycl::nd_item<2> id,
     sycl::sub_group warp = id.get_sub_group();
     float* block_acc = (float*) lmem.get_raw();
     
-    int idx = id.get_group(0);
+    int idx = blockIdx_y(id);
     // go through blocks in reverse order, so the slowest block starts first
     int t0 = T - 1 - T_per_block*id.get_group(1);
 
@@ -695,8 +695,8 @@ void softmax_autoregressive_backward_kernel8(sycl::nd_item<2> id,
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
-    if (warp.get_group_linear_id() == 0) {
-        block_acc[warp.get_local_linear_id()] = 0;
+    if (meta_group_rank(warp) == 0) {
+        block_acc[thread_rank(warp)] = 0;
     }
 
     for(int to = 0; to < T_per_block; ++to) {
@@ -707,7 +707,7 @@ void softmax_autoregressive_backward_kernel8(sycl::nd_item<2> id,
         float* dpreatt_bth = dpreatt + t * T;
 
         float local_sum = 0;
-        for (int t2 = block.get_local_linear_id(); t2 <= t; t2 += BlockSize) {
+        for (int t2 = thread_rank(block); t2 <= t; t2 += BlockSize) {
             local_sum += att_bth[t2] * datt_bth[t2];
         }
 
@@ -719,7 +719,7 @@ void softmax_autoregressive_backward_kernel8(sycl::nd_item<2> id,
         local_sum = sycl::reduce_over_group(warp, block_acc[warp.get_local_linear_id()], sycl::plus<float>{});
         */
 
-        for (int t3 = block.get_local_linear_id(); t3 <= t; t3 += BlockSize) {
+        for (int t3 = thread_rank(block); t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
             // Fix this later

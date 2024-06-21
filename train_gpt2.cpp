@@ -1,160 +1,95 @@
 /*
-GPT-2 Transformer Neural Net trained in raw CUDA
-Non-trivial notes to be aware of:
-
-We are being clever in the backward pass to conserve memory.
-In particular, all parameters use a += in the backward pass, so we
-can later do gradient accumulation. But all activations have = instead of +=
-because these are faster (just read, no write). This is okay for all activations
-except for those in the residual stream, where the gradients have to add. We make
-sure that those parts work out ok and that we do a += as necessary. E.g.,
-the layernorms are connected to the residuals so we += in layernorm backward.
-
-In this file we are using Mixed Precision training, so different activations,
-paramaters, grads and buffers may be kept at different precisions, to take
-advantage of the fast low-precision hardware in the latest GPUs (bf16/fp16),
-and fp8 (coming soon^TM).
-
-Compile:
-make train_gpt2cu
-
-Example launch using bfloat16 on 1 GPU batch size 8, sample/eval every 200 steps:
-Also we're using TinyStories here for example as it is a bigger dataset
-./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-Example launch using bfloat16 on 4 GPUs, same as above:
-mpirun -np 4 ./train_gpt2cu -b 8 -v 200 -s 200 -i data/TinyStories
-
-If you'd like to see train_gpt2.cu produce identical results to
-`python train_gpt2.py`, you can run it like this:
-make train_gpt2cu PRECISION=FP32
-./train_gpt2cu -b 4 -t 64 -l 1e-4 -v 200 -s 200 -a 1 -x 10 -f 0
-This reads & runs in fp32, B=4, T=64, LR=1e-4, val/sample never (200),
--a 1 is "overfit single batch", -x 10 is 10 iterations, and -f 0 disables tf32
+GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
 
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <math.h>
-#include <time.h>
-#include <assert.h>
-#include <float.h>
-#include <string.h>
-#include <unistd.h>
-#include <assert.h>
-// GPU / CUDA related
-#include <sycl/sycl.hpp>
-#include <oneapi/dnnl/dnnl.hpp>
-#include <oneapi/dnnl/dnnl_sycl.hpp>
+#include <string>
+#include <string_view>
+#include <sys/stat.h>
+#include <sys/types.h>
+// ----------- CPU utilities -----------
+// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
+// defines: create_dir_if_not_exists, find_max_step
+#include "llmc/utils.h"
+// defines: tokenizer_init, tokenizer_decode, tokenizer_free
+#include "llmc/tokenizer.h"
+// defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
+// defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
+#include "llmc/dataloader.h"
+// defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
+#include "llmc/rand.h"
+// defines: sample_softmax, random_f32
+#include "llmc/sampler.h"
+// defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
+#include "llmc/logger.h"
+// defines: get_flops_promised
+// Investigate this later
+// #include "llmc/mfu.h"
+// ----------- GPU utilities -----------
+// defines:
+// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
+// NVTX_RANGE_FN
+#include "llmsycl/sycl_common.h"
 
-namespace dnnlsycl = dnnl::sycl_interop;
-namespace syclx = sycl::ext::oneapi;
+// main sycl queue pointer
+sycl::queue* main_stream = nullptr;
 
-// Multi-GPU related
+// defines:
+// Packed128, f128, x128
+// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel
+#include "llmsycl/sycl_utils.hpp"
+
+dnnl::engine *DefaultEngine = nullptr;
+dnnl::stream *DefaultStream = nullptr;
+
+// defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
+// defines: cublas_compute, cublaslt_handle, cublas_handle
+
+// ----------- Layer implementations in CUDA -----------
+// defines: encoder_forward, encoder_backward
+#include "llmsycl/encoder.hpp"
+// defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
+#include "llmsycl/layernorm.hpp"
+// defines: gelu_forward, gelu_backward_inplace
+#include "llmsycl/gelu.hpp"
+#ifdef ENABLE_CUDNN
+// defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
+#include "llmc/cudnn_att.h"
+#else
+// defines: attention_forward, attention_backward
+#include "llmsycl/attention.hpp"
+#endif
+// defines: matmul_forward, matmul_backward
+#include "llmsycl/matmul.hpp"
+// defines: fused_classifier
+#include "llmsycl/fused_classifier.hpp"
+// defines: adamw_kernel3
+#include "llmsycl/adamw.hpp"
+// defines: global_norm_squared
+#include "llmsycl/global_norm.hpp"
+// ----------- Multi-GPU support -----------
 #ifdef MULTI_GPU
 #include <mpi.h>
 #include <nccl.h>
 #endif
-// our own utilities
-// defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
-#include "utils.h"
-// defines: tokenizer_init, tokenizer_decode, tokenizer_free
-#include "tokenizer.h"
 
 // ----------------------------------------------------------------------------
-// CUDA precision settings
 
-enum PrecisionMode {
-    PRECISION_FP32,
-    PRECISION_FP16,
-    PRECISION_BF16
-};
-
-// Default Properties
-typedef float floatN;
-#define CUBLAS_LOWP_COMPUTE cublas_compute_type
+// ----------------------------------------------------------------------------
+// Multi-GPU related
 #ifdef MULTI_GPU
-const ncclDataType_t ncclFloatN = ncclFloat;
-#endif
 
-// Specific configurations based on the enabled precision
 #if defined(ENABLE_FP32)
-typedef float floatX;
-#define PRECISION_MODE PRECISION_FP32
-const char* load_filename = "gpt2_124M.bin";
-const char* precision_mode_str = "fp32";
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclFloat;
-#endif
-
-// use fp16 (note: this may require gradient scaler, currently not implemented!)
 #elif defined(ENABLE_FP16)
-typedef sycl::half floatX;
-#define PRECISION_MODE PRECISION_FP16
-const char* load_filename = "gpt2_124M.bin";
-const char* precision_mode_str = "fp16";
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclHalf;
-#endif
-
 #else // Default to bfloat16
-typedef syclx::bfloat16 floatX;
-#define PRECISION_MODE PRECISION_BF16
-const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights specific filename
-const char* precision_mode_str = "bf16";
-#ifdef MULTI_GPU
 const ncclDataType_t ncclFloatX = ncclBfloat16;
 #endif
-#endif
 
-// convenience macro for calculating grid/block dimensions for kernels
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-
-// SYCL check allocation
-void sycl_malloc_check(void* ptr, const char *file, int line) {
-    if (ptr == nullptr) {
-        printf("[SYCL ERROR] at file %s:%d:\nFailed to allocate memory\n", file, line);
-        exit(EXIT_FAILURE);
-    }
-}
-#define syclMallocCheck(ptr) (sycl_malloc_check(ptr, __FILE__, __LINE__))
-
-// Hack this in to restore John's group algorithm support for non-native types
-// when using sycl::sub_groups
-namespace sycl {
-template <typename T, typename BinaryOperation>
-using EnableIfIsNonNativeOp = sycl::detail::enable_if_t<
-    (!sycl::detail::is_scalar_arithmetic<T>::value &&
-     !sycl::detail::is_vector_arithmetic<T>::value &&
-     std::is_trivially_copyable<T>::value) ||
-        !sycl::detail::is_native_op<T, BinaryOperation>::value,
-    T>;
-
-template <typename Group, typename T, class BinaryOperation>
-EnableIfIsNonNativeOp<T, BinaryOperation> reduce_over_group(Group g, T x,
-                                                 BinaryOperation op) {
-  static_assert(sycl::detail::is_sub_group<Group>::value,
-                "reduce algorithm with user-defined types and operators"
-                "only supports intel::sub_group class.");
-  T result = x;
-  for (int mask = 1; mask < g.get_max_local_range()[0]; mask *= 2) {
-    T tmp = g.shuffle_xor(result, id<1>(mask));
-    if ((g.get_local_id()[0] ^ mask) < g.get_local_range()[0]) {
-      result = op(result, tmp);
-    }
-  }
-  return g.shuffle(result, 0);
-}
-}  // namespace sycl
-
-// Make a global pointer to the SYCL queue to avoid passing it around
-sycl::queue *DefaultQueue = nullptr;
-// oneDNN engine and stream
-dnnl::engine *DefaultEngine = nullptr;
-dnnl::stream *DefaultStream = nullptr;
-
-#ifdef MULTI_GPU
 void nccl_check(ncclResult_t status, const char *file, int line) {
     if (status != ncclSuccess) {
         printf("[NCCL ERROR] at file %s:%d:\n%s\n", file, line, ncclGetErrorString(status));
@@ -173,214 +108,8 @@ void mpi_check(int status, const char *file, int line) {
     }
 }
 #define mpiCheck(err) (mpi_check(err, __FILE__, __LINE__))
-#endif
 
-// GPU helper functions for atomicAdd on smaller than 32-bit types
-#ifdef ENABLE_BF16
-void atomicAddX(syclx::bfloat16* addr, syclx::bfloat16 val) {
-    /*
-    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
-    __nv_bfloat162* ptr_bf16 = reinterpret_cast<__nv_bfloat162*>(ptr_val & ~uintptr_t(0x3));
-
-    // Prepare the value to add, setting the other half to zero
-    __nv_bfloat162 add_val = (ptr_val & 0x3) ? __halves2bfloat162(__ushort_as_bfloat16(0), val)
-                                             : __halves2bfloat162(val, __ushort_as_bfloat16(0));
-    atomicAdd(ptr_bf16, add_val);
-    */
-    // I think the best thing to do here for now is to compare and swap
-    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
-    uint32_t* ptr_32bits = reinterpret_cast<uint32_t*>(ptr_val & ~uintptr_t(0x3));
-
-    sycl::atomic_ref<uint32_t, 
-                     sycl::memory_order::relaxed, 
-                     sycl::memory_scope::device> ref(*ptr_32bits);
-    uint32_t old_val = ref.load(); 
-    uint32_t new_val = old_val;
-    do {
-        sycl::marray<syclx::bfloat16, 2> h2 = *reinterpret_cast<sycl::marray<syclx::bfloat16, 2>*>(&old_val);
-        h2[0] += (ptr_val & 0x3) ? syclx::bfloat16(0.0f) : val;
-        h2[1] += (ptr_val & 0x3) ? val : syclx::bfloat16(0.0f);
-        new_val = *reinterpret_cast<uint32_t*>(&h2);
-    }
-    while (!ref.compare_exchange_weak(old_val, new_val));
-}
-#endif
-#ifdef ENABLE_FP16
-void atomicAddX(sycl::half* addr, sycl::half val) {
-    // Same thing as bfloat16
-    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
-    uint32_t* ptr_32bits = reinterpret_cast<uint32_t*>(ptr_val & ~uintptr_t(0x3));
-
-    sycl::atomic_ref<uint32_t, 
-                     sycl::memory_order::relaxed, 
-                     sycl::memory_scope::device> ref(*ptr_32bits);
-    uint32_t old_val = ref.load(); 
-    uint32_t new_val = old_val;
-    do {
-        sycl::marray<sycl::half, 2> h2 = *reinterpret_cast<sycl::marray<sycl::half, 2>*>(&old_val);
-        h2[0] += (ptr_val & 0x3) ? sycl::half(0.0f) : val;
-        h2[1] += (ptr_val & 0x3) ? val : sycl::half(0.0f);
-        new_val = *reinterpret_cast<uint32_t*>(&h2);
-    }
-    while (!ref.compare_exchange_weak(old_val, new_val));
-}
-#endif
-void atomicAddX(float* addr, float val) {
-    sycl::atomic_ref<float, 
-                     sycl::memory_order::relaxed, 
-                     sycl::memory_scope::device> ref(*addr);
-    ref += val;
-}
-
-// ----------------------------------------------------------------------------
-// Packed128 data structure, which forces the compiler to use 128-bit loads/stores
-// in GPUs that support (the LDG.128 and STS.128 instructions)
-// This is a bit similar to the use of float4 in the case of 32-bit floats, but
-// supports arbitrary precision.
-
-template<class ElementType>
-struct alignas(16) Packed128 {
-    Packed128() = default;
-    explicit Packed128(sycl::int4 bits) {
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        // Fix this later
-        *reinterpret_cast<sycl::int4*>(payload) = bits;
-        
-    }
-
-    ElementType& operator[](int index) {
-        return payload[index];
-    }
-    const ElementType& operator[](int index) const {
-        return payload[index];
-    }
-    sycl::int4 get_bits() const {
-        sycl::int4 bits;
-        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
-        // Fix this later
-        bits = *reinterpret_cast<const sycl::int4*>(payload);
-        return bits;
-    }
-    // e.g. sizeof(int4) is 16 (4 X 4 bytes), sizeof(bfloat16) = 2, so size = 8
-    // so in the case where ElementType = bfloat16, we store 8 elements in one Packed128
-    static constexpr const int size = sizeof(sycl::int4) / sizeof(ElementType);
-    ElementType payload[size];
-};
-
-// short-form typedef
-typedef Packed128<float> f128;
-typedef Packed128<floatX> x128;
-
-// load a Packed128 from an aligned memory address
-template<class ElementType>
-Packed128<ElementType> load128(const ElementType* address) {
-    return Packed128<ElementType>{*reinterpret_cast<const sycl::int4*>(address)};
-}
-
-// load a Packed128 from an aligned memory address with streaming cache hint
-template<class ElementType>
-Packed128<ElementType> load128cs(const ElementType* address) {
-    // Fix this later
-    // return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
-    return Packed128<ElementType>{*reinterpret_cast<const sycl::int4*>(address)};
-}
-
-// store a Packed128 to an aligned memory address
-template<class ElementType>
-void store128(ElementType* target, Packed128<ElementType> value) {
-    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
-}
-
-// store a Packed128 to an aligned memory address with streaming cache hint
-template<class ElementType>
-void store128cs(ElementType* target, Packed128<ElementType> value) {
-    // Fix this later
-    //__stcs(reinterpret_cast<int4*>(target), value.get_bits());
-    *reinterpret_cast<sycl::int4*>(target) = value.get_bits();
-}
-
-// ----------------------------------------------------------------------------
-// Random Number Generatiom
-
-// Simple xorshift RNG
-unsigned int random_u32(unsigned long long *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(unsigned long long *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
-
-// SquirrelNoise5 - Squirrel's Raw Noise utilities (version 5)
-// This gives us a random number from threadIdx/blockIdx + a single seed for the entire GPU
-// todo - possibly overkill and we don't need such high quality random numbers? (tbd)
-// http://eiserloh.net/noise/SquirrelNoise5.hpp
-constexpr unsigned int SquirrelNoise5(int positionX, unsigned int seed)
-{
-	constexpr unsigned int SQ5_BIT_NOISE1 = 0xd2a80a3f;	// 11010010101010000000101000111111
-	constexpr unsigned int SQ5_BIT_NOISE2 = 0xa884f197;	// 10101000100001001111000110010111
-	constexpr unsigned int SQ5_BIT_NOISE3 = 0x6C736F4B; // 01101100011100110110111101001011
-	constexpr unsigned int SQ5_BIT_NOISE4 = 0xB79F3ABB;	// 10110111100111110011101010111011
-	constexpr unsigned int SQ5_BIT_NOISE5 = 0x1b56c4f5;	// 00011011010101101100010011110101
-	unsigned int mangledBits = (unsigned int) positionX;
-	mangledBits *= SQ5_BIT_NOISE1;
-	mangledBits += seed;
-	mangledBits ^= (mangledBits >> 9);
-	mangledBits += SQ5_BIT_NOISE2;
-	mangledBits ^= (mangledBits >> 11);
-	mangledBits *= SQ5_BIT_NOISE3;
-	mangledBits ^= (mangledBits >> 13);
-	mangledBits += SQ5_BIT_NOISE4;
-	mangledBits ^= (mangledBits >> 15);
-	mangledBits *= SQ5_BIT_NOISE5;
-	mangledBits ^= (mangledBits >> 17);
-	return mangledBits;
-}
-constexpr unsigned int Get1dNoiseUint(int positionX, unsigned int seed)
-{
-	return SquirrelNoise5(positionX, seed);
-}
-constexpr unsigned int Get2dNoiseUint(int indexX, int indexY, unsigned int seed)
-{
-	constexpr int PRIME_NUMBER = 198491317; // Large prime number with non-boring bits
-	return SquirrelNoise5(indexX + (PRIME_NUMBER * indexY), seed);
-}
-constexpr float Get1dNoiseZeroToOne(int index, unsigned int seed)
-{
-	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
-	return (float)(ONE_OVER_MAX_UINT * (double) SquirrelNoise5(index, seed));
-}
-constexpr float Get2dNoiseZeroToOne(int indexX, int indexY, unsigned int seed)
-{
-	constexpr double ONE_OVER_MAX_UINT = (1.0 / (double) 0xFFFFFFFF);
-	return (float)(ONE_OVER_MAX_UINT * (double) Get2dNoiseUint(indexX, indexY, seed));
-}
-
-// stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, syclx::bfloat16 *out, unsigned int seed) {
-    // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(id.get_local_linear_id(), id.get_group(0), seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits = *reinterpret_cast<unsigned int*>(&in); //__float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = syclx::bfloat16(*reinterpret_cast<float*>(&float_bits));
-}
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, sycl::half *out, unsigned int seed) {
-    unsigned int random = Get2dNoiseUint(id.get_local_linear_id(), id.get_group(0), seed);
-    unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits = *reinterpret_cast<unsigned int*>(&in); //__float_as_uint(in);
-    unsigned int rounded_bits = float_bits & 0x0000FFFF;
-    float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = sycl::half(*reinterpret_cast<float*>(&float_bits));
-    // *out = (float)in; // todo - implement this...
-}
-inline void stochastic_rounding(sycl::nd_item<1> id, float in, float *out, unsigned int random) {
-    *out = in; // dummy function for when floatX is float (FP32 mode)
-}
+#endif // MULTI_GPU
 
 // ----------------------------------------------------------------------------
 // MPI / multi-processing setup
@@ -390,6 +119,15 @@ typedef struct {
     int process_rank;      // Rank of this process among all MPI processes. 0 if no multi-GPU.
     int num_processes;     // Total number of processes. 1 if no multi-GPU.
     int local_device_idx;  // This process GPU index on current machine. 0 if no multi-GPU.
+
+    // Zero Redundancy Optimizer stage - https://fairscale.readthedocs.io/en/stable/deep_dive/oss_sdp_fsdp.html
+    // 0-Disabled
+    // 1-Optimizer State Sharding (OSS)
+    // 2-Optimizer + Gradient State Sharding (SDP)
+    // 3-Optimizer + Gradient + Horizontal Model Sharding (FSDP)
+    int zero_stage;
+    size_t shard_num_parameters;
+    size_t shard_offset;
 #ifdef MULTI_GPU
     ncclComm_t nccl_comm;  // NCCL communication primitive, used for collective multi-GPU work.
 #endif
@@ -457,6 +195,7 @@ MultiGpuConfig multi_gpu_config_init(int *argc, char ***argv) {
     return result;
 #else
     printf("Multi-GPU support is disabled. Using a single GPU.\n");
+    
     MultiGpuConfig result;
     result.process_rank = 0;
     result.num_processes = 1;
@@ -472,6 +211,14 @@ void multi_gpu_config_free(const MultiGpuConfig* multi_gpu_config) {
 #endif
 }
 
+void multi_gpu_barrier(const MultiGpuConfig* multi_gpu_config) {
+#ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes > 1) {
+        mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+    }
+#endif
+}
+
 // convenience function that only prints if the rank of process is zero
 void printf0(const char *format, ...) {
     if (multi_gpu_config.process_rank == 0) {
@@ -482,1134 +229,32 @@ void printf0(const char *format, ...) {
     }
 }
 
-// ----------------------------------------------------------------------------
-// all the kernels
+void set_zero_configs(MultiGpuConfig* multi_gpu_config, int zero_stage, size_t total_parameters) {
 
-void encoder_forward_kernel2(sycl::nd_item<1> id, floatX* out,
-                               int* inp, floatX* wte, floatX* wpe,
-                               int B, int T, int C) {
-    int idx = id.get_global_id(0);
-    int N = B * T * C;
+    multi_gpu_config->zero_stage = 0;
+    multi_gpu_config->shard_num_parameters = total_parameters;
+    multi_gpu_config->shard_offset = 0;
 
-    if (idx < N) {
-        int bt = idx / C;
-        int b = bt / T;
-        int t = bt % T;
-        int c = idx % C;
-
-        int ix = inp[b * T + t];
-
-        floatX* out_btc = out + b * T * C + t * C + c;
-        floatX* wte_ix = wte + ix * C + c;
-        floatX* wpe_tc = wpe + t * C + c;
-        *out_btc = (floatX)((float)*wte_ix + (float)*wpe_tc);
+    // Check the Zero Stage and define sharding parameters
+    if (zero_stage == 0) {
+        printf0("| Zero Optimization is disabled                                              |\n");
     }
-}
-
-// really bad naive kernel with atomicAdd
-void encoder_backward_kernel(sycl::nd_item<1> id, floatX* dwte, floatX* dwpe,
-                                        const floatX* dout, const int* inp,
-                                        int B, int T, int C) {
-    int idx = id.get_global_id(0);
-    int N = B * T * C;
-
-    if (idx < N) {
-        int bt = idx / C;
-        int b = bt / T;
-        int t = bt % T;
-        int c = idx % C;
-
-        int ix = inp[b * T + t];
-
-        const floatX* dout_btc = dout + b * T * C + t * C + c;
-        floatX* dwte_ix = dwte + ix * C + c;
-        floatX* dwpe_tc = dwpe + t * C + c;
-
-        atomicAddX(dwte_ix, (floatX)*dout_btc);
-        atomicAddX(dwpe_tc, (floatX)*dout_btc);
-    }
-}
-
-void layernorm_forward_kernel3(sycl::nd_item<1> id, floatX* __restrict__ out, floatX* __restrict__ mean, floatX* __restrict__ rstd,
-                                    const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
-                                    const floatX* __restrict__ bias, int N, int C) {
-    sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
-    if(idx >= N) { return; } // guard
-
-    // the row of input that this group of threads is responsible for
-    const floatX* x = inp + idx * C;
-
-    // mean
-    float sum = 0.0f;
-   for (int i = warp.get_local_linear_id(); i < C; i += warp.get_max_local_range()[0]) {
-        sum += (float)x[i];
-    }
-    sum = sycl::reduce_over_group(warp, sum, sycl::plus<float>{}); 
-    float m = sum / C;
-     if(warp.leader() && mean != nullptr) {
-        // Fix later
-        //__stcs(mean + idx, (floatX)m);
-        mean[idx] = (floatX)m;
-    }
-
-    // rstd
-    sum = 0.0f;
-    for (int i = warp.get_local_linear_id(); i < C; i += warp.get_max_local_range()[0]) {
-        float diff = (float)x[i] - m;
-        sum += diff * diff;
-    }
-    sum = sycl::reduce_over_group(warp, sum, sycl::plus<float>{});
-    float s = sycl::rsqrt(sum / C + 1e-5f);
-    if(warp.leader() && rstd != nullptr) {
-        // Fix later
-        // __stcs(rstd + idx, (floatX)s);
-        rstd[idx] = (floatX)s;
-    }
-
-    // final normalization and scaling by weight/bias
-    floatX* o = out + idx * C;
-    for (int c = warp.get_local_linear_id(); c < C; c += warp.get_max_local_range()[0]) {
-        // load and store using the .cs "streaming" hint to the compiler,
-        // indicating that this data will not be reused soon, and can be streamed through the caches
-        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
-        //float n = s * ((float)__ldcs(x+c) - m);
-        float n = s * ((float)x[c] - m);
-        //__stcs(o+c, (floatX)(n * (float)weight[c] + (float)bias[c]));
-         o[c] = (floatX)(n * (float)weight[c] + (float)bias[c]);
-    }
-}
-
-// inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
-void permute_kernel(sycl::nd_item<1> id, floatX* q, floatX* k, floatX* v,
-                               const floatX* inp,
-                               int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
-    int idx = id.get_global_id(0);
-    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-        int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
-    }
-}
-
-void permute_kernel_backward(sycl::nd_item<1> id, floatX* dinp,
-                                        const floatX* dq, const floatX* dk, const floatX* dv,
-                                        int B, int N, int NH, int d) {
-    int idx = id.get_global_id(0);
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-
-        int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        dinp[inp_idx] = dq[idx];
-        dinp[inp_idx + NH * d] = dk[idx];
-        dinp[inp_idx + 2 * (NH * d)] = dv[idx];
-    }
-}
-
-void unpermute_kernel(sycl::nd_item<1> id, floatX* inp, floatX *out, int B, int N, int NH, int d) {
-   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-
-    int idx = id.get_global_id(0);;
-    // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        out[other_idx] = inp[idx];
-    }
-}
-
-void unpermute_kernel_backward(sycl::nd_item<1> id, floatX* dinp, const floatX *dout, int B, int N, int NH, int d) {
-    int idx = id.get_global_id(0);
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
-        int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-        dinp[idx] = (floatX)dout[other_idx];
-    }
-}
-
-void softmax_forward_kernel5(sycl::nd_item<1> id, floatX* out, float inv_temperature, const floatX* inp, int N, int T) {
-    // inp, out shape: (N, T, T), where N = B * NH
-    // fuses the multiplication by scale inside attention
-    // directly autoregressive, so we only compute the lower triangular part
-    // uses the online softmax algorithm
-    assert(T % 4  == 0);
-    sycl::sub_group warp = id.get_sub_group();
-    // micro-optimization: we iterate backwards so that
-    // after the softmax backward operation completes, the cache retains the
-    // part of the matrix close to the upper left corner, which benefits the
-    // matmul operation that immediately follows.
-    // int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank(); // forward order
-    int idx = (id.get_group_range(0) - id.get_group(0) - 1) * warp.get_group_linear_range() + warp.get_group_linear_id(); // backward order
-    if(idx >= N * T) {
-        return;
-    }
-    int own_pos = idx % T;
-    int pos_by_4 = own_pos / 4;
-
-    // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const floatX* x = inp + idx * T;
-
-    // not INF, so we don't get NaNs accidentally when subtracting two values.
-    float maxval = -FLT_MAX;
-    float sumval = 0.0f;
-
-    const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
-    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
-        float regarray[4];
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            regarray[k] = (float)x_aligned[4*i + k];
+    else if (zero_stage == 1) {
+        if (total_parameters % multi_gpu_config->num_processes != 0) {
+            printf0("| Zero Optimization is disabled, Can't equally partition parameters          |\n");
+            multi_gpu_config->zero_stage = 0;
         }
-        float old_maxval = maxval;
-        for(int k = 0; k < 4; ++k) {
-            maxval = sycl::fmax(maxval, regarray[k]);
-        }
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
-        for(int k = 0; k < 4; ++k) {
-            sumval += sycl::exp(inv_temperature * (regarray[k] - maxval));
+        else {
+            printf0("| Zero Stage1 is enabled                                                     |\n");
+            multi_gpu_config->zero_stage = 1;
+            multi_gpu_config->shard_num_parameters = total_parameters / multi_gpu_config->num_processes;
+            multi_gpu_config->shard_offset = multi_gpu_config->process_rank * multi_gpu_config->shard_num_parameters;
         }
     }
-
-    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
-        float old_maxval = maxval;
-        maxval = sycl::fmax(maxval, (float)x[4*pos_by_4 + warp.get_local_linear_id()]);
-        sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
-        sumval += sycl::exp(inv_temperature * ((float)x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+    else{
+        printf0("| Disabling Zero Optimization, Zero Stage2 and Stage3 are not yet supported  |\n");
+        multi_gpu_config->zero_stage = 0;
     }
-
-    float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>{});
-    sumval *= sycl::exp(inv_temperature * (maxval - global_maxval));
-
-    float sum = sycl::reduce_over_group(warp, sumval, sycl::plus<float>{});
-    float norm = 1.f / sum;
-
-    // divide the whole row by the sum
-    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
-        // recalculation is faster than doing the round-trip through memory.
-        float ev = sycl::exp(inv_temperature * ((float)x[i] - global_maxval));
-        out[idx * T + i] = (floatX)(ev * norm);
-    }
-}
-
-void residual_forward_kernel(sycl::nd_item<1> id, floatX* out, floatX* inp1, floatX* inp2, int N) {
-    int idx = id.get_global_id(0);
-    if (idx < N) {
-        out[idx] = (floatX)((float)inp1[idx] + (float)inp2[idx]);
-    }
-}
-
-#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
-void gelu_forward_kernel2(sycl::nd_item<1> id, floatX* out, const floatX* inp, int N) {
-    int i = (id.get_global_id(0)) * x128::size;
-    if (i < N) {
-        x128 packed_out;
-        x128 packed_inp = load128cs(inp + i); // load and do not keep in cache
-        for(int k = 0; k < packed_inp.size; ++k) {
-            float xi = (float)packed_inp[k];
-            float cube = 0.044715f * xi * xi * xi;
-            packed_out[k] = (floatX)(0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube))));
-        }
-        // store instead of storecs (without cache streaming) in case it is useful for the
-        // data to be in the cache for the next operation after this GeLU
-        store128(out + i, packed_out);
-    }
-}
-
-void gelu_backward_kernel(sycl::nd_item<1> id, floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
-    int i = id.get_global_id(0);
-    if (i < N) {
-        float x = (float)inp[i];
-        float cube = 0.044715f * x * x * x;
-        float tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        float tanh_out = sycl::tanh(tanh_arg);
-        float coshf_out = sycl::cosh(tanh_arg);
-        float sech_out = 1.0f / (coshf_out * coshf_out);
-        float local_grad = 0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR * (1.0f + 3.0f * 0.044715f * x * x);
-        dinp[i] = (floatX)(local_grad * (float)dout[i]);
-    }
-}
-
-// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
-// dbias = dout.sum((0,1))
-// the idea is to employ one block to reduce along several columns,
-// where each block has a width of 32 columns to ensure coalesced access.
-// at the end we accumulate the reductions performed by the warps in each block via shared memory
-void matmul_backward_bias_kernel4(sycl::nd_item<1> id, floatX* dbias, const floatX* dout, int B, int T, int OC,
-                                  sycl::local_accessor<float> lmem) {
-    // this kernel is launched with 1D grid_dim of OC/32
-    // for example let's say block_size is 128
-    float *smem = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // of size block_size (128)
-    sycl::sub_group warp = id.get_sub_group();
-    const int warpSize = warp.get_max_local_range()[0]; 
-    const int warp_id = warp.get_group_linear_id(); // warp index in the block, 0,1,2,3
-    const int lane_id = warp.get_local_linear_id(); // thread index in the warp, 0,1,2,...,31
-    const int tl = id.get_group(0) * warpSize; // pointer to the start column for this block
-    const int vstep = warp.get_group_linear_range(); // number of warps in a block, e.g. 4
-
-    // pointer to the start of the column for one lane of threads
-    // so e.g. 4 threads (of the same lane_id) will reduce this one column
-    const floatX* dout_col = dout + tl + lane_id;
-
-    // column reductions by looping through the rows
-    // each of the 4 threads offsets by its warp_id and then skips by vstep
-    // together these 4 threads cover all B*T rows of this (lane_id) column
-    // importantly, consecutive threads (in threadId) are processing adjacent columns,
-    // leading to a coalesced memory access pattern
-    float dout_sum = 0.0f;
-    for (int row = warp_id; row < B * T; row += vstep) {
-        dout_sum += (float)dout_col[row * OC];
-    }
-    smem[lane_id + warp_id * warpSize] = dout_sum;
-    sycl::group_barrier(id.get_group());
-
-    // warp_id 0 reduces the shared memory column-wise, linearly
-    dout_sum = 0.0f;
-    if (warp_id == 0) {
-        for (int j = 0; j < vstep; j++) {
-            dout_sum += smem[lane_id + j * warpSize];
-        }
-        dbias[tl + lane_id] = (floatX)dout_sum;
-    }
-}
-
-// single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
-void layernorm_backward_kernel6(sycl::nd_item<1> id, floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C, sycl::local_accessor<float> lmem) {
-    float* shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw();; // size = 2 * C + 1
-
-    sycl::group block = id.get_group();
-    sycl::sub_group warp = id.get_sub_group();
-    int base_idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
-
-    // the first half of shared memory is bias, second is weight
-    float* dbias_shared = shared;
-    float* dweight_shared = shared + C;
-
-    // init shared memory to zero
-    #pragma unroll 4
-    for (int i = id.get_local_linear_id(); i < C; i  += id.get_local_range(0)) {
-       dbias_shared[i] = 0.0f;
-       dweight_shared[i] = 0.0f;
-    }
-    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
-    sycl::group_barrier(block); 
-
-    int warps_in_grid = id.get_group_range(0) * warp.get_group_linear_range();
-    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
-        int b = idx / T;
-        int t = idx % T;
-
-        const floatX* dout_bt = dout + b * T * C + t * C;
-        const floatX* inp_bt = inp + b * T * C + t * C;
-        floatX* dinp_bt = dinp + b * T * C + t * C;
-        const float mean_bt = (float)mean[b * T + t];
-        const float rstd_bt = (float)rstd[b * T + t];
-
-        // first: two reduce operations
-        float dnorm_mean = 0.0f;
-        float dnorm_norm_mean = 0.0f;
-        for (int i = warp.get_local_linear_id(); i < C; i  += warp.get_max_local_range()[0]) {
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-            dnorm_mean += dnorm_i;
-            dnorm_norm_mean += dnorm_i * norm_bti;
-        }
-        dnorm_mean = sycl::reduce_over_group(warp, dnorm_mean, sycl::plus<float>{});
-        dnorm_norm_mean = sycl::reduce_over_group(warp, dnorm_norm_mean, sycl::plus<float>{});
-        dnorm_mean = dnorm_mean / C;
-        dnorm_norm_mean = dnorm_norm_mean / C;
-
-        // now iterate again and accumulate all the gradients
-        for (int i = warp.get_local_linear_id(); i < C; i += warp.get_max_local_range()[0]) {
-            // Fix this later
-            // float dout_i = (float)__ldcs(&dout_bt[i]);
-            // float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
-            float dout_i = (float)dout_bt[i];
-            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
-            float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dbias_ref(dbias_shared[i]);
-            dbias_ref += dout_i;
-            // gradient contribution to weight
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dweight_ref(dweight_shared[i]);
-            dweight_ref += norm_bti * dout_i;
-            // gradient contribution to input
-            float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
-            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
-        }
-    }
-
-    // Accumulate into a FP32 scratchpad
-    // BF16 atomics are potentially much slower... and this is more precise!
-    // todo - could potentially avoid the extra copy if floatX is FP32, fairly negligible though
-    sycl::group_barrier(block);
-    float* scratch_dbias = scratch;
-    float* scratch_dweight = scratch + C;
-    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
-    for(int i = id.get_local_linear_id(); i < C; i+= id.get_local_range(0)) {
-        sycl::atomic_ref<float, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> dbias_ref(scratch_dbias[i]);
-        dbias_ref += dbias_shared[i];
-        sycl::atomic_ref<float, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> dweight_ref(scratch_dweight[i]);
-        dweight_ref += dweight_shared[i];
-    }
-     sycl::group_barrier(block);
-    if (block.leader()) {
-        sycl::atomic_ref<uint, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> flag_ref(*scratchFlag);
-        *tmp_flag = flag_ref.fetch_add(1);
-    }
-     sycl::group_barrier(block);
-    if (*tmp_flag == id.get_group_range(0)-1) {
-        for(int i = id.get_local_linear_id(); i < C; i+= id.get_local_range(0)) {
-            // todo - potentially do stochastic rounding here as well
-            dbias[i] = (floatX)scratch_dbias[i];
-            dweight[i] = (floatX)scratch_dweight[i];
-        }
-    }
-}
-
-void softmax_autoregressive_backward_kernel(sycl::nd_item<2> id, 
-                                            // sycl::multi_ptr<float[32], sycl::access::address_space::local_space> lmem,
-                                            floatX* dpreatt, const floatX* datt, const floatX* att,
-                                            int B, int T, int C, float scale) {
-    constexpr const int BlockSize = 256;
-    constexpr int T_per_block = 4;
-    sycl::group block = id.get_group();
-    sycl::sub_group warp = id.get_sub_group();
-    // Can nix the block_acc if we're not using it?
-    // float* block_acc = (float*) lmem.get_raw();
-
-    int idx = id.get_group(0);
-    // go through blocks in reverse order, so the slowest block starts first
-    int t0 = T - 1 - T_per_block*id.get_group(1);
-
-    att += idx * T * T;
-    datt += idx * T * T;
-    dpreatt += idx * T * T;
-
-    /*
-    if (warp.get_group_linear_id() == 0) {
-        block_acc[warp.get_local_linear_id()] = 0;
-    }
-    */
-
-    for(int to = 0; to < T_per_block; ++to) {
-        int t = t0 - to;
-        if(t < 0) return;
-        const floatX* att_bth = att + t * T;
-        const floatX* datt_bth = datt + t * T;
-        floatX* dpreatt_bth = dpreatt + t * T;
-
-        float local_sum = 0;
-        for (int t2 = block.get_local_linear_id(); t2 <= t; t2 += BlockSize) {
-            local_sum += (float)att_bth[t2] * (float)datt_bth[t2];
-        }
-
-        /*
-        block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
-        block.sync();
-        local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
-        */
-        local_sum = sycl::reduce_over_group(block, local_sum, sycl::plus<float>{});
-
-        for (int t3 = block.get_local_linear_id(); t3 <= t; t3 += BlockSize) {
-            // don't touch the cache. Some parts will still be here from the previous loop, and
-            // we want to exploit those.
-            // Fix this later
-            // float acc = (float)__ldcs(att_bth + t3) * ((float)__ldcs(datt_bth + t3) - local_sum);
-            // __stcs(dpreatt_bth + t3, (floatX)(scale * acc));
-            float acc = (float)att_bth[t3] * ((float)datt_bth[t3] - local_sum);
-            dpreatt_bth[t3] = (floatX)scale * acc;
-        }
-    }
-}
-
-// Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
-// Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
-inline float lerp(float start, float end, float weight) {
-    return sycl::mad(weight, end, sycl::mad(-weight, start, start));
-}
-
-// Termplate type T instead of floatx
-template <typename Tp, typename Tg>
-void adamw_kernel3(sycl::nd_item<1> id, Tp* params_memory, float* master_params, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
-                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
-                              unsigned int seed) {
-   int i = id.get_global_id(0);
-   if (i >= num_parameters) return;  // guard
-   float grad = (float)grads_memory[i];
-   float m = m_memory[i];
-   float v = v_memory[i];
-   // update the first moment (momentum)
-   m = lerp(grad, m, beta1);
-   m_memory[i] = m;
-   // update the second moment (RMSprop)
-   v = lerp(grad * grad, v, beta2);
-   v_memory[i] = v;
-   m /= beta1_correction;  // m_hat
-   v /= beta2_correction;  // v_hat
-   // update the parameters (weight/bias)
-   float old_param = master_params != NULL ? master_params[i] : (float)params_memory[i];
-   float param = old_param - (learning_rate * (m / (sycl::sqrt(v) + eps) + weight_decay * old_param));
-   // if we have master parameters, directly update the two weight copies
-    if (master_params != NULL) {
-        params_memory[i] = (floatX)param; // low-precision copy, for use in the forward pass
-        master_params[i] = param; // float copy, for use in the next parameter update
-    } else {
-        // without a master copy of params in float, do a direct update in low precision
-        // and use stochastic rounding to mitigate loss of training stability
-        unsigned int random = Get2dNoiseUint(id.get_local_linear_id(), id.get_group(0), seed);
-        stochastic_rounding(id, param, &params_memory[i], random);
-    }
-}
-
-struct SoftmaxParams {
-    float Scale;
-    float Offset;
-};
-
-SoftmaxParams prepare_softmax_blockwide_nofloat4(sycl::nd_item<1> id,
-                                                   int idx, const floatX* inp, int V, int P) {
-    // same but not float4
-    // one row of inp, i.e. inp[idx, :] of shape (V,)
-    sycl::group block = id.get_group();
-
-    const floatX* x = inp + idx * P;
-    float thread_maxval = -INFINITY;
-    float thread_sumval = 0.0f;
-    // do the loop in reverse to maximise probability of L2 cache hits
-    // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = V + id.get_local_linear_id() - id.get_local_range(0); i >= 0; i -= id.get_local_range(0)) {
-        float v = (float)x[i];
-        float old_maxval = thread_maxval;
-        thread_maxval = sycl::fmax(thread_maxval, v);
-        thread_sumval *= sycl::exp((old_maxval - thread_maxval));
-        thread_sumval += sycl::exp(v - thread_maxval);
-    }
-
-    // two reductions of up to 1024 threads:
-    // Using the SYCL group algorithms as it's a lot cleaner looking.
-
-    float block_maxval = sycl::reduce_over_group(block, thread_maxval, -FLT_MAX, sycl::maximum<float>{});
-    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
-    thread_sumval *= sycl::exp(thread_maxval - block_maxval);
-    float block_sumval = sycl::reduce_over_group(block, thread_sumval, 0.0f, sycl::plus<float>{});
-    // return the softmax parameters
-    return SoftmaxParams{1.f / block_sumval, block_maxval};
-}
-
-// same as 2 but not using float4 (see dev/cuda/classifier_fused.cu)
-// will _update_ logits to logit gradients
-void fused_classifier_kernel3(sycl::nd_item<1> id, floatX* logits, floatX* losses, floatX* probs,
-                                         const floatX* dlosses, const int* targets,
-                                         int B, int T, int V, int P) {
-    int idx = id.get_group(0);
-    int ix = targets[idx];
-
-    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
-    SoftmaxParams sp = prepare_softmax_blockwide_nofloat4(id, idx, logits, V, P);
-
-    // calculate the probability needed for the loss and update (single-threaded)
-    if(id.get_group().leader()) {
-        float prob = sycl::exp((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
-        losses[idx] = (floatX)(-sycl::log(prob));
-    }
-
-    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
-    float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
-    // calculate the gradients directly, saves bandwidth from probs during training
-    // but also supports writing probs for inference-only and debugging
-    const floatX* logits_vec = logits + idx * P;
-    // note that we use the padded dimension P to access data, but we only ever
-    // modify the elements up to V, ignoring the padded dimensions and leaving them at 0
-    for (int i = id.get_local_linear_id(); i < V; i += id.get_local_range(0)) {
-        // this is the 2nd read of logits after the one in prepare_softmax2
-        // this data will never be needed again, so we reduce cache persistence
-        // Fix this later
-        // float v = (float)__ldcs(&logits_vec[i]);
-        float v = (float)logits_vec[i];
-        float prob = sycl::exp(v - sp.Offset) * sp.Scale;
-        if (probs != NULL) {
-            probs[idx * P + i] = (floatX)prob;
-        }
-        float indicator = (i == ix) ? 1.0f : 0.0f;
-        logits[idx * P + i] = (floatX)((prob - indicator) * dloss);
-    }
-}
-
-void copy_and_cast_kernel(sycl::nd_item<1> id, float* dst, const floatX* src, size_t n) {
-    // a small kernel to copy and cast, i.e. `dst <- (float) src`
-    const size_t i = id.get_global_id(0);
-    if (i < n) { dst[i] = (float)src[i]; }
-}
-
-// ----------------------------------------------------------------------------
-// kernel launchers
-
-void encoder_forward(floatX* out,
-                     int* inp, floatX* wte, floatX* wpe,
-                     int B, int T, int C) {
-    const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        encoder_forward_kernel2(id, out, inp, wte, wpe, B, T, C);
-    });
-}
-
-void encoder_backward(floatX* dwte, floatX* dwpe,
-                    const floatX* dout, const int* inp,
-                    int B, int T, int C) {
-    const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        encoder_backward_kernel(id, dwte, dwpe, dout, inp, B, T, C);
-    });
-}
-
-void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
-                       floatX* inp, floatX* weight, floatX* bias,
-                       int B, int T, int C) {
-    const int block_size = 512;
-    const int N = B * T;
-    const int grid_size = CEIL_DIV(N * 32, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        layernorm_forward_kernel3(id, out, mean, rstd, inp, weight, bias, N, C);
-    });
-}
-
-// uses cuBLASLt to fuse the bias and gelu. does not work with OC = 50257 (last layer)
-// https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-// https://github.com/NVIDIA/CUDALibrarySamples/blob/master/cuBLASLt/LtSgemm/sample_cublasLt_LtSgemm.cu
-void matmul_forward_cublaslt(floatX* out,
-                     floatX* inp, floatX* weight, floatX* bias,
-                     int B, int T, int C, int OC) {
-    int has_bias = (bias != NULL);
-
-    // Setup engine and stream
-    auto &engine = *DefaultEngine;
-    auto &stream = *DefaultStream;
-
-    // Create memory descriptors
-    dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
-    switch (PRECISION_MODE) {
-        case PrecisionMode::PRECISION_FP32:
-            elt_type = dnnl::memory::data_type::f32;
-            break;
-        case PrecisionMode::PRECISION_FP16:
-            elt_type = dnnl::memory::data_type::f16;
-            break;
-        case PrecisionMode::PRECISION_BF16:
-            elt_type = dnnl::memory::data_type::bf16;
-            break;
-        default:
-            printf("Unsupported precision mode\n");
-            exit(EXIT_FAILURE);
-    }
-    auto inp_md = dnnl::memory::desc({B*T, C}, elt_type, dnnl::memory::format_tag::ab);
-    auto weight_md = dnnl::memory::desc({C, OC}, elt_type, dnnl::memory::format_tag::ba);
-    auto out_md = dnnl::memory::desc({B*T, OC}, elt_type, dnnl::memory::format_tag::ab);
- 
-    // Create memory objects
-    auto inp_mem = dnnlsycl::make_memory(inp_md, engine, dnnlsycl::memory_kind::usm, inp);
-    auto weight_mem = dnnlsycl::make_memory(weight_md, engine, dnnlsycl::memory_kind::usm, weight);
-    auto out_mem = dnnlsycl::make_memory(out_md, engine, dnnlsycl::memory_kind::usm, out);
-        
-    if (has_bias) {
-        auto bias_md = dnnl::memory::desc({1, OC}, elt_type, dnnl::memory::format_tag::ab);
-        auto bias_mem = dnnlsycl::make_memory(bias_md, engine, dnnlsycl::memory_kind::usm, bias);
-
-        // Create primitive descriptor
-        auto matmul_pd = dnnl::matmul::primitive_desc(engine, inp_md, weight_md, bias_md, out_md);
-
-        // Create primitive
-        auto matmul_prim = dnnl::matmul(matmul_pd);
-
-        // Set arguments and execute
-        matmul_prim.execute(stream, {
-            {DNNL_ARG_SRC, inp_mem},
-            {DNNL_ARG_WEIGHTS, weight_mem},
-            {DNNL_ARG_BIAS, bias_mem},
-            {DNNL_ARG_DST, out_mem}
-        });
-    } else {
-        // Create primitive descriptor
-        auto matmul_pd = dnnl::matmul::primitive_desc(engine, inp_md, weight_md, out_md);
-
-        // Create primitive
-        auto matmul_prim = dnnl::matmul(matmul_pd);
-    
-        // Set arguments and execute
-        matmul_prim.execute(stream, {
-            {DNNL_ARG_SRC, inp_mem},
-            {DNNL_ARG_WEIGHTS, weight_mem},
-            {DNNL_ARG_DST, out_mem}
-        });
-    }
-}
-
-void attention_forward(floatX* out, floatX* qkvr, floatX* att,
-                       floatX* inp,
-                       int B, int T, int C, int NH) {
-    // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
-    // Its contents will be overwritten by this function.
-    const int block_size = 256;
-    const int softmax_block_size = 256;
-
-    // inp is (B, T, 3C) QKV
-    // preatt, att are (B, NH, T, T)
-    // output is (B, T, C)
-    int HS = C / NH; // head size
-
-    // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    floatX *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    int total_threads = B * NH * T * HS;
-    int num_blocks = CEIL_DIV(total_threads, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
-        permute_kernel(id, q, k, v, inp, B, T, NH, HS);
-    });
-
-    floatX* preatt = inp;
-
-    dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
-    switch (PRECISION_MODE) {
-        case PrecisionMode::PRECISION_FP32:
-            elt_type = dnnl::memory::data_type::f32;
-            break;
-        case PrecisionMode::PRECISION_FP16:
-            elt_type = dnnl::memory::data_type::f16;
-            break;
-        case PrecisionMode::PRECISION_BF16:
-            elt_type = dnnl::memory::data_type::bf16;
-            break;
-        default:
-            printf("Unsupported precision mode\n");
-            exit(EXIT_FAILURE);
-    }
-
-    // Setup engine and stream
-    auto &engine = *DefaultEngine;
-    auto &stream = *DefaultStream;
-
-    // Create memory descriptors
-    auto q_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-    auto k_md = dnnl::memory::desc({B * NH, HS, T}, elt_type, dnnl::memory::format_tag::acb);
-    auto preatt_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto q_mem = dnnlsycl::make_memory(q_md, engine, dnnlsycl::memory_kind::usm, q);
-    auto k_mem = dnnlsycl::make_memory(k_md, engine, dnnlsycl::memory_kind::usm, k);
-    auto preatt_mem = dnnlsycl::make_memory(preatt_md, engine, dnnlsycl::memory_kind::usm, preatt);
-
-    // Create primitive descriptor
-    auto matmul_pd = dnnl::matmul::primitive_desc(engine, q_md, k_md, preatt_md);
-
-    // Create primitive
-    auto matmul_prim = dnnl::matmul(matmul_pd);
- 
-    // Set arguments and execute
-    matmul_prim.execute(stream, {
-        {DNNL_ARG_SRC, q_mem},
-        {DNNL_ARG_WEIGHTS, k_mem},
-        {DNNL_ARG_DST, preatt_mem}
-    });
-
-    // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
-    int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*softmax_block_size, softmax_block_size), [=](sycl::nd_item<1> id) {
-        softmax_forward_kernel5(id, att, scale, preatt, B * NH, T);
-    });
-
-    // new approach: first cuBLAS another batched matmul
-    floatX* vaccum = inp;
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    auto att_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::abc);  
-    auto v_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-    auto vaccum_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto att_mem = dnnlsycl::make_memory(att_md, engine, dnnlsycl::memory_kind::usm, att);
-    auto v_mem = dnnlsycl::make_memory(v_md, engine, dnnlsycl::memory_kind::usm, v);
-    auto vaccum_mem = dnnlsycl::make_memory(vaccum_md, engine, dnnlsycl::memory_kind::usm, vaccum);
-
-    // Create primitive descriptor
-    auto matmul_pd2 = dnnl::matmul::primitive_desc(engine, att_md, v_md, vaccum_md);
-
-    // Create primitive
-    auto matmul_prim2 = dnnl::matmul(matmul_pd2);
- 
-    // Set arguments and execute
-    matmul_prim2.execute(stream, {
-        {DNNL_ARG_SRC, att_mem},
-        {DNNL_ARG_WEIGHTS, v_mem},
-        {DNNL_ARG_DST, vaccum_mem}
-    });
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = CEIL_DIV(B * T * C, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
-        unpermute_kernel(id, vaccum, out, B, T, NH, HS);
-    });
-}
-
-void residual_forward(floatX* out, floatX* inp1, floatX* inp2, int N) {
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        residual_forward_kernel(id, out, inp1, inp2, N);
-    });
-}
-
-void gelu_forward(floatX* out, const floatX* inp, int N) {
-    const int block_size = 512;
-    const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        gelu_forward_kernel2(id, out, inp, N);
-    });
-}
-
-void gelu_backward(floatX* dinp, const floatX* inp, const floatX* dout, const int N) {
-    const int block_size = 128;
-    const int grid_size = CEIL_DIV(N, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        gelu_backward_kernel(id, dinp, inp, dout, N);
-    });
-}
-
-void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
-                     floatX* dout, floatX* inp, floatX* weight,
-                     int B, int T, int C, int OC) {
-    sycl::queue& queue = *DefaultQueue;                        
-    float one = 1.0f;
-    float zero = 0.0f;
-    // backward to input, uses = in the backward pass (set the gradient)
-    // Setup engine and stream
-    auto &engine = *DefaultEngine;
-    auto &stream = *DefaultStream;
-
-    dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
-    switch (PRECISION_MODE) {
-        case PrecisionMode::PRECISION_FP32:
-            elt_type = dnnl::memory::data_type::f32;
-            break;
-        case PrecisionMode::PRECISION_FP16:
-            elt_type = dnnl::memory::data_type::f16;
-            break;
-        case PrecisionMode::PRECISION_BF16:
-            elt_type = dnnl::memory::data_type::bf16;
-            break;
-        default:
-            printf("Unsupported precision mode\n");
-            exit(EXIT_FAILURE);
-    }
-
-    // Create memory descriptors
-    auto dout_md = dnnl::memory::desc({B*T, OC}, elt_type, dnnl::memory::format_tag::ab);
-    auto weight_md = dnnl::memory::desc({OC, C}, elt_type, dnnl::memory::format_tag::ab);
-    auto dinp_md = dnnl::memory::desc({B*T, C}, elt_type, dnnl::memory::format_tag::ab);
-
-    // Create memory objects
-    auto dout_mem = dnnlsycl::make_memory(dout_md, engine, dnnlsycl::memory_kind::usm, dout);
-    auto weight_mem = dnnlsycl::make_memory(weight_md, engine, dnnlsycl::memory_kind::usm, weight);
-    auto dinp_mem = dnnlsycl::make_memory(dinp_md, engine, dnnlsycl::memory_kind::usm, dinp);
-
-    // Create primitive descriptor
-    auto matmul_pd = dnnl::matmul::primitive_desc(engine, dout_md, weight_md, dinp_md);
-
-    // Create primitive
-    auto matmul_prim = dnnl::matmul(matmul_pd);
- 
-    // Set arguments and execute
-    matmul_prim.execute(stream, {
-        {DNNL_ARG_SRC, dout_mem},
-        {DNNL_ARG_WEIGHTS, weight_mem},
-        {DNNL_ARG_DST, dinp_mem}
-    });
-    // backward to weight, uses += in the backward pass (accumulate the gradient)
-    // Create memory descriptors
-    auto dout_md2 = dnnl::memory::desc({OC, B*T}, elt_type, dnnl::memory::format_tag::ba);
-    auto inp_md = dnnl::memory::desc({B*T, C}, elt_type, dnnl::memory::format_tag::ab);
-    auto dweight_md = dnnl::memory::desc({OC, C}, elt_type, dnnl::memory::format_tag::ab);
-
-    // Create memory objects
-    auto dout_mem2 = dnnlsycl::make_memory(dout_md2, engine, dnnlsycl::memory_kind::usm, dout);
-    auto inp_mem = dnnlsycl::make_memory(inp_md, engine, dnnlsycl::memory_kind::usm, inp);
-    auto dweight_mem = dnnlsycl::make_memory(dweight_md, engine, dnnlsycl::memory_kind::usm, dweight);
-
-    dnnl::post_ops po;
-    po.append_sum(one);
-
-    dnnl::primitive_attr matmul_attr2;
-    matmul_attr2.set_post_ops(po);
-
-    // Create primitive descriptor
-    auto matmul_pd2 = dnnl::matmul::primitive_desc(engine, dout_md2, inp_md, dweight_md, matmul_attr2);
-
-    // Create primitive 
-    auto matmul_prim2 = dnnl::matmul(matmul_pd2);
-
-    // Set arguments and execute
-    matmul_prim2.execute(stream, {
-        {DNNL_ARG_SRC, dout_mem2},
-        {DNNL_ARG_WEIGHTS, inp_mem},
-        {DNNL_ARG_DST, dweight_mem}
-    });
-
-    // backward to bias, if given, does a +=
-    if (dbias != NULL) {
-        const int block_size = 512; // can't do 1024
-        const int grid_size = OC / 32; // for now, OC must be divisible by 32 for this kernel to work
-        DefaultQueue->submit([&](sycl::handler& h) {
-            sycl::local_accessor<float> lmem(block_size, h);
-            h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
-                matmul_backward_bias_kernel4(id, dbias, dout, B, T, OC, lmem);
-            });
-        });
-    }
-}
-
-int get_num_CUs() {
-    // TODO - make this more general for diff types of devices
-    int num_CUs = 0;
-    if (DefaultQueue && DefaultQueue->get_device().is_gpu()) {
-        int num_slices = DefaultQueue->get_device().get_info<sycl::ext::intel::info::device::gpu_slices>();
-        int num_subslices_per_slice = DefaultQueue->get_device().get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
-        num_CUs = num_slices * num_subslices_per_slice;
-    } else {
-        num_CUs = 1;
-    }
-    return num_CUs;
-}
-
-void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
-                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
-                        int B, int T, int C) {
-    const int block_size = 512;
-    const int grid_size = 1 * get_num_CUs();
-    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
-    DefaultQueue->memset(scratch, 0, (2 * C + 1) * sizeof(float)); // todo - memset in parallel with previous kernels using streams
-    DefaultQueue->submit([&](sycl::handler& h) {
-        sycl::local_accessor<float> lmem(shared_mem_size, h);
-        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
-            layernorm_backward_kernel6(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, lmem);
-        });
-    });
-}
-
-// the sequence of transformations in this compound op is:
-// inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* dpreatt, floatX* datt, floatX* scratch,
-                        const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH) {
-    sycl::queue& queue = *DefaultQueue;     
-    const int block_size = 256;
-    int HS = C / NH; // head size
-
-    // FP16 alpha/beta need to be used if and only if CUBLAS_COMPUTE_16F
-    const float alpha = 1.0f, beta = 0.0f;
-    dnnl::memory::data_type elt_type = dnnl::memory::data_type::f32;
-    switch (PRECISION_MODE) {
-        case PrecisionMode::PRECISION_FP32:
-            elt_type = dnnl::memory::data_type::f32;
-            break;
-        case PrecisionMode::PRECISION_FP16:
-            elt_type = dnnl::memory::data_type::f16;
-            break;
-        case PrecisionMode::PRECISION_BF16:
-            elt_type = dnnl::memory::data_type::bf16;
-            break;
-        default:
-            printf("Unsupported precision mode\n");
-            exit(EXIT_FAILURE);
-    }
-
-    // unpack convenience pointers into q, k, v
-    const floatX *q, *k, *v;
-    q = qkvr + 0 * B * T * C;
-    k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
-    floatX *dq, *dk, *dv;
-    dq = dqkvr + 0 * B * T * C;
-    dk = dqkvr + 1 * B * T * C;
-    dv = dqkvr + 2 * B * T * C;
-
-    // backward through the unpermute operation
-    int num_blocks = CEIL_DIV(B * T * C, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
-        unpermute_kernel_backward(id, scratch, dout, B, T, NH, HS);
-    });
-    
-    // backward into datt
-    // Batched matrix multiply with oneDNN
-    // Setup engine and stream
-    auto &engine = *DefaultEngine;
-    auto &stream = *DefaultStream;
-
-    // Create memory descriptors
-    auto scratch_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-    auto v_md = dnnl::memory::desc({B * NH, HS, T}, elt_type, dnnl::memory::format_tag::acb);
-    auto datt_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto scratch_mem = dnnlsycl::make_memory(scratch_md, engine, dnnlsycl::memory_kind::usm, scratch);
-    auto v_mem = dnnlsycl::make_memory(v_md, engine, dnnlsycl::memory_kind::usm, const_cast<floatX *>(v));
-    auto datt_mem = dnnlsycl::make_memory(datt_md, engine, dnnlsycl::memory_kind::usm, datt);
-
-    // Create primitive descriptor
-    auto matmul_pd = dnnl::matmul::primitive_desc(engine, scratch_md, v_md, datt_md);
-
-    // Create primitive
-    auto matmul_prim = dnnl::matmul(matmul_pd);
- 
-    // Set arguments and execute
-    matmul_prim.execute(stream, {
-        {DNNL_ARG_SRC, scratch_mem},
-        {DNNL_ARG_WEIGHTS, v_mem},
-        {DNNL_ARG_DST, datt_mem}
-    });
-      
-    // backward into dv
-    // Create memory descriptors
-    auto att_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::acb);
-    // scratch_md is already defined
-    auto dv_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto att_mem = dnnlsycl::make_memory(att_md, engine, dnnlsycl::memory_kind::usm, const_cast<floatX*>(att));
-    // scratch_mem is already defined
-    auto dv_mem = dnnlsycl::make_memory(dv_md, engine, dnnlsycl::memory_kind::usm, dv);
-
-    // Create primitive descriptor
-    auto matmul_pd2 = dnnl::matmul::primitive_desc(engine, att_md, scratch_md, dv_md);
-
-    // Create primitive
-    auto matmul_prim2 = dnnl::matmul(matmul_pd2);
- 
-    // Set arguments and execute
-    matmul_prim2.execute(stream, {
-        {DNNL_ARG_SRC, att_mem},
-        {DNNL_ARG_WEIGHTS, scratch_mem},
-        {DNNL_ARG_DST, dv_mem}
-    });
-    
-    // backward into preatt
-    int hs = C / NH; // head size
-    float scale = 1.0f / sqrtf(hs);
-    DefaultQueue->parallel_for(sycl::nd_range<2>(sycl::range<2>(B * NH, (T / 4) * 256),
-                                                 sycl::range<2>(1, 256)), [=](sycl::nd_item<2> id) {
-        softmax_autoregressive_backward_kernel(id, dpreatt, datt, att, B, T, C, scale);
-    });
-    
-    // backward into q
-    auto dpreatt_md = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::abc);  
-    auto k_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-    auto dq_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto dpreatt_mem = dnnlsycl::make_memory(dpreatt_md, engine, dnnlsycl::memory_kind::usm, dpreatt);
-    auto k_mem = dnnlsycl::make_memory(k_md, engine, dnnlsycl::memory_kind::usm, const_cast<floatX*>(k));
-    auto dq_mem = dnnlsycl::make_memory(dq_md, engine, dnnlsycl::memory_kind::usm, dq);
-
-    // Create primitive descriptor
-    auto matmul_pd3 = dnnl::matmul::primitive_desc(engine, dpreatt_md, k_md, dq_md);
-
-    // Create primitive
-    auto matmul_prim3 = dnnl::matmul(matmul_pd3);
- 
-    // Set arguments and execute
-    matmul_prim3.execute(stream, {
-        {DNNL_ARG_SRC, dpreatt_mem},
-        {DNNL_ARG_WEIGHTS, k_mem},
-        {DNNL_ARG_DST, dq_mem}
-    });
-    
-    // backward into k
-    auto dpreatt_md2 = dnnl::memory::desc({B * NH, T, T}, elt_type, dnnl::memory::format_tag::acb);
-    auto q_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-    auto dk_md = dnnl::memory::desc({B * NH, T, HS}, elt_type, dnnl::memory::format_tag::abc);
-
-    // Create memory objects
-    auto dpreatt_mem2 = dnnlsycl::make_memory(dpreatt_md2, engine, dnnlsycl::memory_kind::usm, dpreatt);
-    auto q_mem = dnnlsycl::make_memory(q_md, engine, dnnlsycl::memory_kind::usm, const_cast<floatX*>(q));
-    auto dk_mem = dnnlsycl::make_memory(dk_md, engine, dnnlsycl::memory_kind::usm, dk);
-
-    // Create primitive descriptor
-    auto matmul_pd4 = dnnl::matmul::primitive_desc(engine, dpreatt_md2, q_md, dk_md);
-
-    // Create primitive
-    auto matmul_prim4 = dnnl::matmul(matmul_pd4);
- 
-    // Set arguments and execute
-    matmul_prim4.execute(stream, {
-        {DNNL_ARG_SRC, dpreatt_mem2},
-        {DNNL_ARG_WEIGHTS, q_mem},
-        {DNNL_ARG_DST, dk_mem}
-    });
-    
-    // backward into inp
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
-        permute_kernel_backward(id, dinp, dq, dk, dv, B, T, NH, HS);
-    });
-}
-
-// replaces logits with logit gradients
-template <typename Type>
-void fused_classifier3(Type* logits, Type* losses,
-                      const Type* dlosses, const int* targets,
-                      int B, int T, int V, int P) {
-    // can't do 1024
-    const int block_size = 512;
-    const int N = B * T;
-    const int grid_size = N;
-    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
-        fused_classifier_kernel3(id, logits, losses, (Type*)NULL, dlosses, targets, B, T, V, P);
-    });
 }
 
 // ----------------------------------------------------------------------------
@@ -1677,20 +322,18 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 // allocate memory for the parameters and point the individual tensors to the right places
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
     // calculate the total number of parameters and bytes across all tensors
-    size_t num_parameters = 0;
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        num_parameters += param_elements[i];
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
     void* params_memory;
-    syclMallocCheck(params_memory = sycl::malloc_device(num_parameters_bytes, *DefaultQueue));
+    syclMallocCheck(params_memory = sycl::malloc_device(num_parameters_bytes, *main_stream));
     // assign all the tensors their place in the array
     floatX** ptrs[] = {
-        &params->wte, &params->wpe, (floatX**)&params->ln1w, (floatX**)&params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, (floatX**)&params->ln2w, (floatX**)&params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, (floatX**)&params->lnfw, (floatX**)&params->lnfb
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -1717,7 +360,7 @@ typedef struct {
     floatX* fch_gelu; // (L, B, T, 4*C)
     floatX* fcproj; // (L, B, T, C)
     floatX* residual3; // (L, B, T, C)
-    floatX* lnf; // (B, T, C)
+    floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
     floatX* lnf_mean; // (B, T)
     floatX* lnf_rstd; // (B, T)
     floatX* losses; // (B, T)
@@ -1731,13 +374,14 @@ typedef struct {
     floatX* output;
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config) {
+void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config config, int recompute) {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
     act_sizes[0] = B * T * C; // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[1] = (recompute < 2) ? L * B * T * C : 0; // ln1
     act_sizes[2] = L * B * T; // ln1_mean
     act_sizes[3] = L * B * T; // ln1_rstd
     act_sizes[4] = L * B * T * C; // atty
@@ -1749,11 +393,13 @@ void fill_in_activation_sizes(size_t* act_sizes, size_t B, size_t T, GPT2Config 
     #endif
     act_sizes[6] = L * B * T * C; // attproj
     act_sizes[7] = L * B * T * C; // residual2
-    act_sizes[8] = L * B * T * C; // ln2
+    // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
+    act_sizes[8] = (recompute < 2) ? L * B * T * C : 0; // ln2
     act_sizes[9] = L * B * T; // ln2_mean
     act_sizes[10] = L * B * T; // ln2_rstd
     act_sizes[11] = L * B * T * 4*C; // fch
-    act_sizes[12] = L * B * T * 4*C; // fch_gelu
+    // if recompute >= 1 then we will recompute gelu_forward during backward and use this as scratch buffer
+    act_sizes[12] = (recompute < 1) ? L * B * T * 4*C : B * T * 4*C;
     act_sizes[13] = L * B * T * C; // fcproj
     act_sizes[14] = L * B * T * C; // residual3
     act_sizes[15] = B * T * C; // lnf
@@ -1798,11 +444,16 @@ void* malloc_and_point(floatX** targets[], const size_t* act_sizes, size_t n) {
         num_activations += act_sizes[i];
     }
     void* acts_memory;
-    syclMallocCheck(acts_memory = sycl::malloc_device<floatX>(num_activations, *DefaultQueue));
+    syclMallocCheck(acts_memory = sycl::malloc_device(num_activations * sizeof(floatX), *main_stream));
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < n; i++) {
-        *(targets[i]) = (floatX*)acts_memory_iterator;
-        acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        // extra protection so we don't accidentally use an empty buffer
+        if(act_sizes[i] == 0) {
+            *(targets[i]) = NULL;
+        }else {
+            *(targets[i]) = (floatX*) acts_memory_iterator;
+            acts_memory_iterator += act_sizes[i] * sizeof(floatX);
+        }
     }
     return acts_memory;
 }
@@ -1860,9 +511,70 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float accumulated_mean_loss; // Mean loss after aggregating it on all GPUs
     floatX* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
+    float* cpu_losses_fp32; // same but fp32
     unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    int use_master_weights;
+    int use_master_weights; // keep master weights copy in float for optim update? 0|1
+    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
+    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
+    sycl::int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 } GPT2;
+
+void gpt2_init_common(GPT2 *model) {
+    // common inits outside of the model weights
+    // the weights are initialized either in:
+    // - gpt2_build_from_checkpoint() if loading from a checkpoint
+    // - gpt2_build_from_random() if starting from scratch
+    // memory lazily initialized in forward()
+    model->acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->cpu_losses_fp32 = NULL;
+    // the B,T params are determined and set, fixed on first batch in forward()
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    // memory lazily initialized in backward()
+    model->grads_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->workload_indices = NULL; // on cpu, for encoder_backward
+    model->bucket_info = NULL; // on cpu, for encoder_backward
+    // memory lazily initialized in update()
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->master_weights = NULL;
+    // other default settings
+    model->rng_state = 13371337; // used in stochastic rounding
+    model->use_master_weights = 1; // safe default: do keep master weights in fp32
+    model->recompute = 1; // good default: recompute gelu but not layernorm
+}
+
+void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
+    // write the model to a checkpoint file
+    printf0("Writing model to %s\n", checkpoint_path);
+    FILE *model_file = fopenCheck(checkpoint_path, "wb");
+    // write the header first
+    int model_header[256];
+    memset(model_header, 0, sizeof(model_header));
+    model_header[0] = 20240326; // magic number
+    assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16);
+    model_header[1] = PRECISION_MODE == PRECISION_FP32 ? 3 : 5; // version
+    model_header[2] = model->config.max_seq_len;
+    model_header[3] = model->config.vocab_size;
+    model_header[4] = model->config.num_layers;
+    model_header[5] = model->config.num_heads;
+    model_header[6] = model->config.channels;
+    model_header[7] = model->config.padded_vocab_size;
+    fwrite(model_header, sizeof(int), 256, model_file);
+    // write the parameters
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
+    main_stream->memcpy(params_memory_cpu, model->params_memory, model->num_parameters_bytes).wait();
+    fwrite(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
+    free(params_memory_cpu);
+    // close file, we're done
+    fcloseCheck(model_file);
+}
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
@@ -1885,6 +597,17 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
         // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
         fprintf(stderr, "---> HINT: try to re-run `python train_gpt2.py`\n");
+        exit(EXIT_FAILURE);
+    }
+    if (PRECISION_MODE == PRECISION_BF16 && version != 5) {
+        fprintf(stderr, "Precision is configured as BF16 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: are you sure you're loading a _bf16.bin file?\n");
+        exit(EXIT_FAILURE);
+    }
+    if (PRECISION_MODE == PRECISION_FP32 && version != 3) {
+        fprintf(stderr, "Precision is configured as FP32 but model at %s is not.\n", checkpoint_path);
+        fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: `make train_gpt2cu PRECISION=FP32`\n");
+        fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
         exit(EXIT_FAILURE);
     }
 
@@ -1910,30 +633,109 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
 
     // read in all the parameters from file and copy them to device
-    float* params_memory_cpu = (float*)mallocCheck(model->num_parameters_bytes);
+    void* params_memory_cpu = (void*)mallocCheck(model->num_parameters_bytes);
     freadCheck(params_memory_cpu, 1, model->num_parameters_bytes, model_file);
-    DefaultQueue->memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
+    main_stream->memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
     free(params_memory_cpu);
     fcloseCheck(model_file);
 
-    // other inits
-    model->acts_memory = NULL;
-    model->grads_memory = NULL;
-    model->m_memory = NULL;
-    model->v_memory = NULL;
-    model->master_weights = NULL;
-    model->grads_acts_memory = NULL;
-    model->inputs = NULL;
-    model->targets = NULL;
-    model->cpu_losses = NULL;
-    model->batch_size = 0;
-    model->seq_len = 0;
-    model->mean_loss = -1.0f; // -1.0f will designate no loss
-    model->rng_state = 13371337;
-    model->use_master_weights = 1; // keep master weights copy in float for optim update?
+    gpt2_init_common(model);
+    // only return from this function once we are certain the params are ready on the GPU
+    main_stream->wait();
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_build_from_random(GPT2 *model, int depth) {
+    // init random (training from scratch)
+
+    // parameterize the size of gpt2 based only on the depth of the model (num_layers)
+    model->config.num_layers = depth;
+    // follows GPT-2 sizes
+    int channels, num_heads;
+    if      (depth == 6)  { channels = 384; num_heads = 6; } // gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; } // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else { fprintf(stderr, "Unsupported depth for now\n"); exit(EXIT_FAILURE); }
+    model->config.channels = channels;
+    model->config.num_heads = num_heads;
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128
+
+    // fill in all the parameter tensor dimensions and types
+    fill_in_parameter_sizes(model->param_elements, model->param_sizeof, model->config);
+    model->num_parameters = 0;
+    model->num_parameters_bytes = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        model->num_parameters += model->param_elements[i];
+        model->num_parameters_bytes += model->param_elements[i] * model->param_sizeof[i];
+    }
+    // create memory for model parameters on the device
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_elements, model->param_sizeof);
+
+    // allocate and random init the memory for all the parameters with GPT-2 schema
+    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    floatX* params_memory_cpu = (floatX*)mallocCheck(model->num_parameters_bytes);
+    memset(params_memory_cpu, 0, model->num_parameters_bytes);
+    // fill in all the weights with random values
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_elements[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                int n = model->param_elements[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_elements[i];
+        }
+    }
+
+    // copy them to GPU
+    main_stream->memcpy(model->params_memory, params_memory_cpu, model->num_parameters_bytes).wait();
+    free(params_memory_cpu);
+
+    gpt2_init_common(model);
+}
+
+void gpt2_forward(GPT2 *model, const int* inputs, const int* targets, size_t B, size_t T, int grad_accum_steps=1) {
+    // right now, this function is fully synchronous with the host
+
     // targets are optional and could be NULL
     // in this function we must be careful and use size_t instead of int, otherwise
     // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
@@ -1945,38 +747,32 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
 
     // convenience parameters
-    size_t V = model->config.vocab_size;
-    size_t Vp = model->config.padded_vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
-
-    // validate inputs, all indices must be in the range [0, V)
-    for(int i = 0; i < B * T; i++) {
-        assert(0 <= inputs[i] && inputs[i] < V);
-        if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
-        }
-    }
+    const size_t V = model->config.vocab_size;
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t L = model->config.num_layers;
+    const size_t NH = model->config.num_heads;
+    const size_t C = model->config.channels;
 
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
+ 
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
         // allocate the space
-        fill_in_activation_sizes(model->act_sizes, B, T, model->config);
+        fill_in_activation_sizes(model->act_sizes, B, T, model->config, model->recompute);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
+        printf0("allocating %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
-        printf0("allocated %d MiB for activations\n", (int)round(num_activations * sizeof(floatX) / (1024 * 1024)));
         // also create memory for caching inputs and targets
-        syclMallocCheck(model->inputs = sycl::malloc_device<int>(B * T, *DefaultQueue));
-        syclMallocCheck(model->targets = sycl::malloc_device<int>(B * T, *DefaultQueue));
-        syclMallocCheck(model->cpu_losses = sycl::malloc_host<floatX>(B * T, *DefaultQueue));
+        syclMallocCheck(model->inputs = sycl::malloc_device<int>(B * T, *main_stream));
+        syclMallocCheck(model->targets = sycl::malloc_device<int>(B * T, *main_stream));
+        syclMallocCheck(model->cpu_losses = sycl::malloc_host<floatX>(B * T, *main_stream));
+        syclMallocCheck(model->cpu_losses_fp32 = sycl::malloc_host<float>(B * T, *main_stream));
     } else {
         // validate B,T is consistent with how we've allocated the memory before
         // in principle we could get more clever here in the future, for now this is safest
@@ -1987,24 +783,34 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
 
     // copy inputs/targets to the model
-    DefaultQueue->memcpy(model->inputs, inputs, B * T * sizeof(int));
+    main_stream->memcpy(model->inputs, inputs, B * T * sizeof(int));
     if (targets != NULL) {
-        DefaultQueue->memcpy(model->targets, targets, B * T * sizeof(int));
+        main_stream->memcpy(model->targets, targets, B * T * sizeof(int));
+    }
+
+    // validate inputs, all indices must be in the range [0, V)
+    // we can do this while the copies are already underway
+    for(int i = 0; i < B * T; i++) {
+        assert(0 <= inputs[i] && inputs[i] < V);
+        if (targets != NULL) {
+            assert(0 <= targets[i] && targets[i] < V);
+        }
     }
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    floatX* residual;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+
+    // first layernorm isn't fused
+    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
     for (int l = 0; l < L; l++) {
 
-        residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
+
+        floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
-        floatX* l_ln1w = params.ln1w + l * C;
-        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_qkvb = params.qkvb + l * 3*C;
         floatX* l_attprojw = params.attprojw + l * C * C;
@@ -2017,75 +823,89 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         floatX* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
-        floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
-        floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_attproj = acts.attproj + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
+        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         floatX* l_fcproj = acts.fcproj + l * B * T * C;
         floatX* l_residual3 = acts.residual3 + l * B * T * C;
 
         // now do the forward pass
-        layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C);
+        matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         floatX* scratch = (floatX*)acts.output;
-        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
-        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
-        residual_forward(l_residual2, residual, l_attproj, B*T*C);
-        layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
-        gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
-        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
-        residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
+        matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, l_attproj, l_ln2w, l_ln2b, B*T, C, main_stream);
+        matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream);
+        gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+
+        // OK, fusion across blocks.
+        if(l+1 != L) {
+            floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
+            floatX* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
+            floatX* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
+            const floatX* l_ln1w = params.ln1w + (l + 1) * C;
+            const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, l_fcproj, l_ln1w, l_ln1b,
+                                    B * T, C, main_stream);
+        } else {
+            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, l_fcproj,
+                                    params.lnfw, params.lnfb,
+                                    B * T, C, main_stream);
+        }
     }
 
-    residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
-    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
 
     // also forward the cross-entropy loss function if we have the targets
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
-        // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        fused_classifier3(acts.output, acts.losses, (floatX*)NULL, model->targets, B, T, V, Vp);
+        const float dloss = 1.0f / (B * T * grad_accum_steps); // results in the uniform average loss over all elements
+        fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, main_stream);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
-        // move the (B,T) losses to CPU
-        DefaultQueue->memcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX)).wait();
+        main_stream->memcpy(model->cpu_losses, acts.losses, B * T * sizeof(floatX)).wait();
         float mean_loss = 0.0f;
-        for (int i=0; i<B*T; i++) { mean_loss += (float)(model->cpu_losses[i]); }
-        mean_loss /= B*T;
+        for (int i = 0; i < B*T; i++) {
+            float loss = (float)(model->cpu_losses[i]);
+            model->cpu_losses_fp32[i] = loss;
+            mean_loss += loss;
+        }
+        mean_loss /= B*T*grad_accum_steps;
         model->mean_loss = mean_loss;
-
     } else {
         // if we don't have targets, we don't have loss
         model->mean_loss = -1.0f;
     }
+    main_stream->wait();
 }
 
 void gpt2_zero_grad(GPT2 *model) {
-    if (model->grads_acts_memory != NULL) { DefaultQueue->memset(model->grads_acts_memory, 0, model->num_grad_acts * sizeof(floatX)); }
-    if (model->grads_memory != NULL) { DefaultQueue->memset(model->grads_memory, 0, model->num_parameters * sizeof(floatX));}
+    if (model->grads_memory != NULL) {
+        main_stream->memset(model->grads_memory, 0, model->num_parameters * sizeof(floatX));
+    }
+    main_stream->wait();
 }
 
-void gpt2_backward(GPT2 *model) {
+void gpt2_backward(GPT2 *model, int* inputs) {
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f) {
         printf("Error: must forward with targets before backward\n");
@@ -2094,31 +914,37 @@ void gpt2_backward(GPT2 *model) {
 
     // lazily allocate the memory for gradients of the weights and activations, if needed
     if (model->grads_memory == NULL) {
+   
         // allocate buffers for weight gradients
+        printf0("allocating %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_elements, model->param_sizeof);
-        printf0("allocated %d MiB for parameter gradients\n", (int)round(model->num_parameters * sizeof(floatX) / (1024 * 1024)));
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass activations and we will save memory.
-        size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
+        size_t bw_act_sizes[NUM_BACKWARD_TENSORS];
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, model->config);
         // count up and allocate the space
-        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         model->num_grad_acts = 0;
         for (size_t i = 0; i < NUM_BACKWARD_TENSORS; i++) {
             model->num_grad_acts += bw_act_sizes[i];
         }
-        printf0("allocated %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
+        printf0("allocating %d MiB for activation gradients\n", (int)round(model->num_grad_acts * sizeof(floatX) / (1024 * 1024)));
+        model->grads_acts_memory = malloc_and_point_backward(&model->grads_acts, bw_act_sizes);
         // init gradients of parameters and activations to zero
         gpt2_zero_grad(model);
+        // initialise cpu scratch buffers for encoder backward
+        size_t num_c_groups = CEIL_DIV(model->config.channels, (WARP_SIZE * x128::size));
+        assert((size_t)(model->batch_size * model->seq_len) * num_c_groups < (1ULL<<31ULL)); // todo - maybe an issue for llama3-400B(?)
+        model->workload_indices = (int*)mallocCheck(sizeof(int) * model->batch_size * model->seq_len * num_c_groups);
+        model->bucket_info = (sycl::int4*)mallocCheck(sizeof(sycl::int4) * model->batch_size * model->seq_len * num_c_groups);
     }
 
     // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
-    size_t B = model->batch_size;
-    size_t T = model->seq_len;
-    size_t Vp = model->config.padded_vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
+    const size_t B = model->batch_size;
+    const size_t T = model->seq_len;
+    const size_t Vp = model->config.padded_vocab_size;
+    const size_t L = model->config.num_layers;
+    const size_t NH = model->config.num_heads;
+    const size_t C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -2126,29 +952,41 @@ void gpt2_backward(GPT2 *model) {
     ActivationTensors acts = model->acts;
     GradActTensors grads_acts = model->grads_acts;
 
+    // reset residual stream gradients (put here to work with gradient accumulation)
+    main_stream->memset(model->grads_acts.residual3, 0, B * T * C * sizeof(floatX));
+
     // re-use the output buffer of the forward pass as a scratchpad during backward pass
     float*  scratchF = (float*)acts.output;
+    floatX* scratchX = (floatX*)acts.output;
 
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
-    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, B, T, C, Vp);
+    matmul_backward(grads_acts.bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
     // backward the final layernorm
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     floatX* dresidual = (floatX*)grads_acts.residual3; // the main buffer holding the gradient in the backward pass
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, grads_acts.bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+
+    // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
+    // scratch for backward computations
+    floatX* dl_btc = residual;
 
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
+
+
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
         floatX* l_ln1w = params.ln1w + l * C;
+        floatX* l_ln1b = params.ln1b + l * C;
         floatX* l_qkvw = params.qkvw + l * 3*C * C;
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
+        floatX* l_ln2b = params.ln2b + l * C;
         floatX* l_fcw = params.fcw + l * 4*C * C;
         floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
         // get the pointers of the gradients of the weights for this layer
@@ -2165,62 +1003,72 @@ void gpt2_backward(GPT2 *model) {
         floatX* dl_fcprojw = grads.fcprojw + l * C * 4*C;
         floatX* dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
-        floatX* l_ln1 = acts.ln1 + l * B * T * C;
+        floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
         floatX* l_ln1_mean = acts.ln1_mean + l * B * T;
         floatX* l_ln1_rstd = acts.ln1_rstd + l * B * T;
         floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
         floatX* l_atty = acts.atty + l * B * T * C;
         floatX* l_residual2 = acts.residual2 + l * B * T * C;
-        floatX* l_ln2 = acts.ln2 + l * B * T * C;
+        floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
         floatX* l_ln2_mean = acts.ln2_mean + l * B * T;
         floatX* l_ln2_rstd = acts.ln2_rstd + l * B * T;
         floatX* l_fch = acts.fch + l * B * T * 4*C;
-        floatX* l_fch_gelu = acts.fch_gelu + l * B * T * 4*C;
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
 
-        // we need a B x T x C buffer; thankfully, the forward activation for lnf isn't needed anymore,
-        // so we can co-opt it here.
-        floatX* dl_btc = (floatX*)acts.lnf;
         floatX* dl_bt4c = (floatX*)grads_acts.bt4c;
 
-        // backprop this layer
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C);
-        gelu_backward(dl_bt4c, l_fch, dl_bt4c, B*T*4*C);
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
+        // start the backward pass for this layer
+        if(model->recompute >= 1) {
+            // recompute >= 1 means we recompute gelu. in this case,
+            // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C, main_stream);
+        }
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream);
+        gelu_backward_inplace(dl_bt4c, l_fch, B*T*4*C, main_stream);
+        if(model->recompute >= 2) {
+            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+        }
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C);
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
+        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
-        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C);
+        attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch;        // this is B x T x 4C, so even larger than what we need
         floatX* dl_preatt = (floatX*)grads_acts.preatt; // dedicated scratchpad allocation
-        floatX* scratchX =  (floatX*)acts.output;
-        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward(dl_bt4c, buffer_b, dl_preatt, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         #endif
-
+        if(model->recompute >= 2) {
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+        }
         // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
+        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+
+    main_stream->wait();
 }
 
-// Compute a mean of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
-float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_config) {
+// Compute sum of a single CPU value across all GPU processes. No-op when multi-GPU is disabled.
+float multi_gpu_cpu_float_sum(float value) {
 #ifdef MULTI_GPU
-    // MPI doesn't support all reduce with mean, so we sum up, then divide.
+    // note MPI doesn't support all reduce with mean, only sum
     float result;
     mpiCheck(MPI_Allreduce(&value, &result, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD));
-    return result / multi_gpu_config->num_processes;
+    return result;
 #else
     return value;
 #endif
@@ -2228,234 +1076,359 @@ float multi_gpu_cpu_float_mean(float value, const MultiGpuConfig* multi_gpu_conf
 
 // Averages out the loss and gradients across all GPUs. No-op when multi-GPU is disabled.
 // todo - this version only works if all the parameters are the same size (floatX)
-void gpt2_multi_gpu_accumulate(GPT2* model, MultiGpuConfig* multi_gpu_config) {
-    // Average all losses.
-    model->accumulated_mean_loss = multi_gpu_cpu_float_mean(model->mean_loss, multi_gpu_config);
+void gpt2_multi_gpu_loss_and_grad_reduce(GPT2* model, MultiGpuConfig* multi_gpu_config) {
 #ifdef MULTI_GPU
-    // Average all gradients.
-    ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
-        model->num_parameters,
-        ncclFloatX, ncclAvg,
-        multi_gpu_config->nccl_comm,
-        // use 0 for default stream (all other computations use this stream)
-        /*stream=*/0));
+    NVTX_RANGE_FN();
+    // If there's only one process, there is nothing to do
+    if (multi_gpu_config->num_processes == 1) { return; }
+    // Average all losses.
+    model->accumulated_mean_loss = multi_gpu_cpu_float_sum(model->mean_loss) / multi_gpu_config->num_processes;
+    // Now average the gradients
+    if(multi_gpu_config->zero_stage == 0) {
+        // no ZERO == standard DDP: Average all gradients.
+        ncclCheck(ncclAllReduce(model->grads_memory, model->grads_memory,
+                                model->num_parameters,
+                                ncclFloatX, ncclAvg,
+                                multi_gpu_config->nccl_comm, main_stream));
+    } else if (multi_gpu_config->zero_stage == 1) {
+        // ZERO-1: Get the average gradient only for local shard
+        floatX* local_grads_memory = (floatX*) model->grads_memory + multi_gpu_config->shard_offset;
+        ncclCheck(ncclReduceScatter(model->grads_memory, local_grads_memory,
+                                    multi_gpu_config->shard_num_parameters,
+                                    ncclFloatX, ncclAvg,
+                                    multi_gpu_config->nccl_comm, main_stream));
+    }
 #endif
+    main_stream->wait();
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
-    // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
+float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_clip, int t, MultiGpuConfig* multi_gpu_config) {
+    // update the model parameters using the AdamW optimizer
+    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
+    // so we may not be responsible for the entire parameter tensor
+    // also, this function was very simple a while back but become very complex, only because we want to
+    // selectively weight decay some, but not all tensors :(
+    // TODO: revisit and probably refactor this entire function
+    size_t shard_num_parameters = multi_gpu_config->shard_num_parameters; // num parameters we are responsible for
+    size_t shard_offset = multi_gpu_config->shard_offset; // offset into the full parameter tensor
+    floatX* params_memory = (floatX*)model->params_memory;
+    floatX* grads_memory = (floatX*)model->grads_memory;
 
-    // lazily allocate the memory for m_memory and v_memory
+    // lazily allocate m,v memory and master weights (usually on the first iteration)
     if (model->m_memory == NULL) {
-        syclMallocCheck(model->m_memory = sycl::malloc_device<float>(model->num_parameters, *DefaultQueue));
-        syclMallocCheck(model->v_memory = sycl::malloc_device<float>(model->num_parameters, *DefaultQueue));
-        DefaultQueue->memset(model->m_memory, 0, model->num_parameters * sizeof(float));
-        DefaultQueue->memset(model->v_memory, 0, model->num_parameters * sizeof(float));
-        printf0("allocated %zu MiB for AdamW optimizer state m\n", (model->num_parameters * sizeof(float)) >> 20);
-        printf0("allocated %zu MiB for AdamW optimizer state v\n", (model->num_parameters * sizeof(float)) >> 20);
-        if (model->use_master_weights == 1) {
-            // allocate one more buffer to keep the master copy of weights as float, and copy the weights over
-            syclMallocCheck(model->master_weights = sycl::malloc_device<float>(model->num_parameters, *DefaultQueue));
-            // ok this is a porting gotcha - need to make sure we're not capturing host pointers in GPU code
-            float *master_weights = model->master_weights;
-            floatX *params_memory = (floatX*)model->params_memory;
-            int num_parameters = model->num_parameters;
-            DefaultQueue->parallel_for(sycl::nd_range<1>(CEIL_DIV(model->num_parameters, 512) * 512, 512), [=](sycl::nd_item<1> id) {
-                copy_and_cast_kernel(id, master_weights, (floatX*)params_memory, num_parameters);
-            });
-            printf0("allocated %zu MiB for master copy of params\n", (model->num_parameters * sizeof(float)) >> 20);
-        }
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        syclMallocCheck(model->m_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+        syclMallocCheck(model->v_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+        main_stream->memset(model->m_memory, 0, shard_num_parameters * sizeof(float));
+        main_stream->memset(model->v_memory, 0, shard_num_parameters * sizeof(float));
+    }
+    if (model->use_master_weights == 1 && model->master_weights == NULL) {
+        printf0("allocating %zu MiB for master copy of params\n", (shard_num_parameters * sizeof(float)) >> 20);
+        syclMallocCheck(model->master_weights = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+        size_t grid_size = CEIL_DIV(shard_num_parameters, 512);
+        float* master_ptr = (float*)model->master_weights;
+        floatX* params_ptr = params_memory + shard_offset;
+        main_stream->parallel_for(sycl::nd_range<1>(grid_size * 512, 512), [=](sycl::nd_item<1> id) {
+            copy_and_cast_kernel(id, master_ptr, params_ptr, shard_num_parameters);
+        });
     }
 
-    int block_size = 512;
-    int num_blocks = CEIL_DIV(model->num_parameters, block_size);
-    float beta1_correction = 1.0f - powf(beta1, t);
-    float beta2_correction = 1.0f - powf(beta2, t);
+    // gradient clipping
+    // repurposing this buffer (which isn't needed now) to write grad norm into it
+    float* grad_norm_squared = (float*)model->acts.output;
+    if (multi_gpu_config->zero_stage == 1) {
+        // ^1 because of the ncclReduceScatter() in gpt2_multi_gpu_loss_and_grad_reduce,
+        // grads_memory only contains the averaged gradients at the local shard
+        // so we only calculate the grad norm at the grads_memory belonging to the local shard
+        global_norm_squared(grad_norm_squared, grads_memory + shard_offset, shard_num_parameters, main_stream);
+    } else {
+        // the ncclAllReduce() in gpt2_multi_gpu_loss_and_grad_reduce has averaged the gradients across all GPUs
+        // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+        global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, main_stream);
+    }
+    // transfer the gradient norm to CPU
+    float grad_norm_squared_cpu = 0.0f;
+    main_stream->memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float)).wait();
+    if (multi_gpu_config->zero_stage == 1) {
+        // further sum the (partial) squared norm across all GPUs (see comment ^1 above)
+        grad_norm_squared_cpu = multi_gpu_cpu_float_sum(grad_norm_squared_cpu);
+    }
+
+    if(!isfinite(grad_norm_squared_cpu)) {
+        // may happen due to some issue (e.g. overflow?)
+        // TODO: later may want to keep a global counter of instabilities like this
+        printf0("[WARNING]: grad norm is not finite, skipping AdamW update\n");
+        return -1.0f;
+    }
+    float grad_norm_cpu = sqrtf(grad_norm_squared_cpu);
+    float grad_scale = (grad_norm_cpu > grad_clip) ? grad_clip / grad_norm_cpu : 1.0f;
+
+    // AdamW update
     unsigned int seed = random_u32(&model->rng_state);
-    // ok this is a porting gotcha (again) - need to make sure we're not capturing host pointers in GPU code
-    floatX *params_memory = (floatX*)model->params_memory;
-    floatX *grads_memory = (floatX*)model->grads_memory;
-    float *m_memory = model->m_memory;
-    float *v_memory = model->v_memory;
-    float *master_weights = model->master_weights;
-    int num_parameters = model->num_parameters;
-    DefaultQueue->parallel_for(sycl::nd_range<1>(num_blocks * block_size, block_size), [=](sycl::nd_item<1> id) {
-        adamw_kernel3(id, (floatX*)params_memory, master_weights,
-                      (floatX*)grads_memory, m_memory, v_memory,
-                      num_parameters,
-                      learning_rate, beta1, beta2, beta1_correction, beta2_correction, eps, weight_decay, seed);
-    });
+    // individually call the adamw_kernel3 on all parameter tensors separately
+    size_t offset = 0;
+    for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        size_t num_parameters = model->param_elements[i];
+        // the scope of this GPU's work is the range: [shard_offset, shard_offset + shard_num_parameters)
+        // this parameter's values are in the range:  [offset, offset + num_parameters)
+        // so we are responsible for some of its parameters if:
+        // 1) this parameter ends after we begin (i.e. offset + num_parameters > shard_offset)
+        // 2) this parameter begins before we end (i.e. offset < shard_offset + shard_num_parameters)
+        if(offset + num_parameters > shard_offset && offset < shard_offset + shard_num_parameters) {
+
+            // ok this tensor has at least one element inside the range of responsibility of this GPU
+            // let's figure out the exact span we wish to call the AdamW kernel on
+            floatX* params_ptr = NULL;
+            floatX* grad_ptr = NULL;
+            float* m_ptr = NULL;
+            float* v_ptr = NULL;
+            float* master_ptr = NULL;
+            size_t local_params = 0;
+            // does the tensor begin before our responsibility?
+            if(offset <= shard_offset) {
+                // if so, our start point is exactly that of our responsibility, i.e. shard_offset
+                params_ptr = params_memory + shard_offset;
+                grad_ptr = grads_memory + shard_offset;
+                // note that (master_weights, m, v) are already only the "local slice" for this GPU,
+                // and are of size shard_num_parameters, instead of the total number of parameters
+                // so they do not get offset, i.e. we just start at their index 0
+                if (model->master_weights != NULL) { master_ptr = model->master_weights; }
+                m_ptr = model->m_memory;
+                v_ptr = model->v_memory;
+                // the number of parameters we have to update is the minimum of two ranges
+                local_params = std::min(shard_num_parameters, (offset + num_parameters) - shard_offset);
+            } else {
+                // our start point is the location of this tensor, i.e. offset
+                params_ptr = params_memory + offset;
+                grad_ptr = grads_memory + offset;
+                // this arithmetic gave me a headache but my little doodle example says it's right
+                size_t delta = offset - shard_offset;
+                if (model->master_weights != NULL) { master_ptr = model->master_weights + delta; }
+                m_ptr = model->m_memory + delta;
+                v_ptr = model->v_memory + delta;
+                local_params = std::min(num_parameters, shard_num_parameters - delta);
+            }
+            // we only want to weight decay the 2D tensors and leave all 1D tensors alone
+            // in particular this also decays the embedding weights, but this is ok:
+            // - the token embeddings are weight shared and participate in the final projection to logits
+            // - the position embeddings actively participate at every forward/backward pass
+            float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+            // ok finally call the kernel
+            adamw_update(params_ptr, master_ptr, grad_ptr,
+                         m_ptr, v_ptr, local_params, learning_rate,
+                         beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
+        }
+        // advance the offset pointer to the next parameter tensor
+        offset += num_parameters;
+    }
+
+    main_stream->wait();
+    return grad_norm_cpu;
+}
+
+void gpt2_multi_gpu_param_gather(GPT2 *model, MultiGpuConfig* multi_gpu_config)
+{
+#ifdef MULTI_GPU
+    if (multi_gpu_config->num_processes == 1) { return; } // 1 process => noop
+    if (multi_gpu_config->zero_stage == 1) {
+        // gather updated shards of model->params_memory from each process
+        ncclCheck(ncclAllGather((floatX*)model->params_memory + multi_gpu_config->shard_offset, (floatX*)model->params_memory,
+                                multi_gpu_config->shard_num_parameters, ncclFloatX,
+                                multi_gpu_config->nccl_comm, main_stream));
+    }
+    cudaCheck(cudaGetLastError());
+#endif
+    main_stream->wait();
+}
+
+float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
+    /*
+    Estimate model flops utilization (MFU)
+    ref: Section 2.1 of https://arxiv.org/pdf/2001.08361
+    Note: Ideally, the N here would be only the parameters that actually
+    participate in matrix multiplications. In this N, we are over-estimating by
+    including LayerNorm params, biases, and the position embedding weights,
+    but these are very small terms. Also keep in mind that we would want to exclude
+    the token embedding weights, but in GPT-2 these are weight shared, so they
+    participate in the classifier matmul, so they are correct to be included in N.
+    Note 2: The first term (6 * N) in flops_per_token is all weight matmuls, the
+    second is the attention matmul, which is also usually a small contribution.
+    */
+    size_t N = model->num_parameters;
+    int L = model->config.num_layers;
+    int C = model->config.channels;
+    int T = model->seq_len;
+    size_t flops_per_token = 6 * N + (size_t)6 * L * C * T;
+    size_t flops_per_step = flops_per_token * num_tokens;
+    // express our flops throughput as ratio of A100 bfloat16 peak flops
+    float flops_achieved = (float)flops_per_step * (1.0f / dt); // per second
+    float flops_promised = -1.f; //get_flops_promised(deviceProp.name, PRECISION_MODE) * 1e12f;
+    if(flops_promised < 0) {
+        return -1.f;   // don't know
+    }
+    float mfu = flops_achieved / flops_promised;
+    return mfu;
 }
 
 void gpt2_free(GPT2 *model) {
-    sycl::free(model->params_memory, *DefaultQueue);
-    sycl::free(model->grads_memory, *DefaultQueue);
-    sycl::free(model->m_memory, *DefaultQueue);
-    sycl::free(model->v_memory, *DefaultQueue);
-    sycl::free(model->master_weights, *DefaultQueue);
-    sycl::free(model->acts_memory, *DefaultQueue);
-    sycl::free(model->grads_acts_memory, *DefaultQueue);
-    sycl::free(model->inputs, *DefaultQueue);
-    sycl::free(model->targets, *DefaultQueue);
-    sycl::free(model->cpu_losses, *DefaultQueue);
+    sycl::free(model->params_memory, *main_stream);
+    sycl::free(model->grads_memory, *main_stream);
+    sycl::free(model->m_memory, *main_stream);
+    sycl::free(model->v_memory, *main_stream);
+    sycl::free(model->master_weights, *main_stream);
+    sycl::free(model->acts_memory, *main_stream);
+    sycl::free(model->grads_acts_memory, *main_stream);
+    sycl::free(model->inputs, *main_stream);
+    sycl::free(model->targets, *main_stream);
+    sycl::free(model->cpu_losses, *main_stream);
+    sycl::free(model->cpu_losses_fp32, *main_stream);    
+    free(model->workload_indices);
+    free(model->bucket_info);
+}
+
+// ----------------------------------------------------------------------------
+// common init & free code for all of train/test/profile
+
+void common_start(bool override_enable_tf32 = true, bool print_device_info = true) {
+
+    // get CUDA device infos
+    /*
+    cudaGetDeviceProperties(&deviceProp, multi_gpu_config.local_device_idx);
+    if (print_device_info) {
+        printf("[System]\n");
+        printf("Device %d: %s\n", multi_gpu_config.local_device_idx, deviceProp.name);
+    }
+    */
+
+    // set up the cuda streams. atm everything is on the single main stream
+    
+    // nvtxNameCudaStreamA(main_stream, "main stream");
+
+
+    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
+    bool enable_tf32 = false;
+
+
+    #ifdef ENABLE_CUDNN
+    create_cudnn();
+    #endif
+}
+
+void common_free(GPT2 &model) {
+    
+    #ifdef ENABLE_CUDNN
+    destroy_cudnn();
+    #endif
 }
 
 #ifndef TESTING
-// if we are TESTING (see test_gpt2.cu), we'll skip the int main below
+// if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 
 // ----------------------------------------------------------------------------
-// data loader lite: returns random batches of data from a file of integers
+// training resumption logic, very useful when jobs crash once in a while
+// the goal is that we can resume optimization from any checkpoint, bit-perfect
+// note that "state" refers to things not already saved in the model checkpoint file
 
-typedef struct {
-    // Distributed data parallel specifics.
-    // Each worker loads it's own chunk of data.
-    int process_rank;
-    int num_processes;
-    // hyperparameters. use size_t to prevent overflow
-    size_t B;
-    size_t T;
-    // input handling and its state
-    FILE* tokens_file;
-    long file_size;
-    long current_position;
-    // output memory
-    int* batch;
-    int* inputs;
-    int* targets;
-    // convenience variables
-    size_t num_batches;
-} DataLoader;
+void save_state(const char* filename, int step, GPT2* model, DataLoader* loader) {
+    printf("Writing state to %s\n", filename);
+    FILE *state_file = fopenCheck(filename, "wb");
+    int state_header[256];
+    memset(state_header, 0, sizeof(state_header));
+    // basic identifying information
+    state_header[0] = 20240527; // magic number
+    state_header[1] = 1; // version number
+    state_header[2] = multi_gpu_config.num_processes; // number of processes
+    state_header[3] = multi_gpu_config.process_rank; // rank of this process
+    // int main state, start at 10 to leave some padding
+    state_header[10] = step; // step of the optimization
+    // model state, state, start at 20 to leave some padding
+    *((unsigned long long*)&state_header[20]) = model->rng_state; // random number generator state
+    // dataloader state, start at 30 to leave some padding
+    state_header[30] = loader->current_shard; // shard of the dataset
+    *((int64_t*)&state_header[31]) = loader->current_position; // position in shard
+    fwrite(state_header, sizeof(int), 256, state_file);
+    // write AdamW m, v, and master_weights here (they are all float)
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    main_stream->memcpy(cpu_buffer, model->m_memory, shard_num_parameters * sizeof(float)).wait();
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    main_stream->memcpy(cpu_buffer, model->v_memory, shard_num_parameters * sizeof(float)).wait();
+    fwrite(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    free(cpu_buffer);
+    fclose(state_file);
+}
 
-void dataloader_init(DataLoader *loader, const MultiGpuConfig* multi_gpu_config, const char* filename, size_t B, size_t T) {
-    loader->process_rank = multi_gpu_config->process_rank;
-    loader->num_processes = multi_gpu_config->num_processes;
-    loader->B = B;
-    loader->T = T;
-
-    // open the input file for reading
-    loader->tokens_file = fopenCheck(filename, "rb");
-
-    // determine the file size
-    fseekCheck(loader->tokens_file, 0, SEEK_END);
-    loader->file_size = ftell(loader->tokens_file);
-    fseekCheck(loader->tokens_file, 0, SEEK_SET);
-    if (loader->file_size < (B * T + 1) * sizeof(int)) {
-        printf("Error: file size is too small for the batch size and sequence length\n");
-        exit(EXIT_FAILURE);
+void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename) {
+    FILE *state_file = fopenCheck(filename, "rb");
+    int state_header[256];
+    freadCheck(state_header, sizeof(int), 256, state_file);
+    assert(state_header[0] == 20240527); // magic number
+    assert(state_header[1] == 1); // version number
+    assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
+    assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    *step = state_header[10]; // step of the optimization
+    model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
+    int current_shard = state_header[30]; // shard of the dataset
+    int64_t current_position = *((int64_t*)&state_header[31]); // position in shard
+    dataloader_resume(loader, current_shard, current_position);
+    // read AdamW m, v (they are all float)
+    // also allocate the m, v memory in the model, if it does not yet exist
+    size_t shard_num_parameters = multi_gpu_config.shard_num_parameters;
+    if (model->m_memory == NULL) {
+        printf0("allocating %zu MiB for AdamW optimizer state m\n", (shard_num_parameters * sizeof(float)) >> 20);
+        printf0("allocating %zu MiB for AdamW optimizer state v\n", (shard_num_parameters * sizeof(float)) >> 20);
+        syclMallocCheck(model->m_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
+        syclMallocCheck(model->v_memory = sycl::malloc_device<float>(shard_num_parameters, *main_stream));
     }
-    loader->current_position = loader->process_rank * B * T * sizeof(int); // start at the beginning
-
-    // allocate space for B*T + 1 integers to store the inputs and targets
-    // Using CUDA CPU pinned memory for faster PCI Express transfers to GPU
-    // See: https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/
-    // Note: we may want to do something different here for Intel GPUs.
-    loader->batch = sycl::malloc_host<int>(B * T + 1, *DefaultQueue);
-    loader->inputs = loader->batch;
-    loader->targets = loader->batch + 1; // targets are shifted by one
-    // note: we definitely want to advance by B * T; That is the "stride" by which we move
-    // the window of tokens. We only load B * T + 1 tokens because our targets are offset by 1
-    loader->num_batches = loader->file_size / (loader->num_processes * B * T * sizeof(int));
-}
-
-void dataloader_reset(DataLoader *loader) {
-    loader->current_position = 0;
-}
-
-void dataloader_next_batch(DataLoader *loader) {
-    size_t B = loader->B;
-    size_t T = loader->T;
-    // if we are at the end of the file, loop back to the beginning
-    if (loader->current_position + (loader->num_processes * B * T + 1) * sizeof(int) > loader->file_size) {
-        loader->current_position = loader->process_rank * B * T * sizeof(int);
-    }
-    // read the B*T+1 integers from the file into batch
-    fseekCheck(loader->tokens_file, loader->current_position, SEEK_SET);
-    freadCheck(loader->batch, sizeof(int), B*T+1, loader->tokens_file);
-    // advance the current position by B*T*num_processes integers
-    // note: the "stride" of tokens by which we move each time is definitely B * T
-    loader->current_position += loader->num_processes * B * T * sizeof(int);
-}
-
-void dataloader_free(DataLoader *loader) {
-    fcloseCheck(loader->tokens_file);
-    sycl::free(loader->batch, *DefaultQueue);
-}
-
-// ----------------------------------------------------------------------------
-// sampler: takes probabilities and samples integers from them
-
-int sample_softmax(const float* logits, int n, float coin) {
-    // sample index from logits (converted to probabilities using softmax)
-    // coin is a random number in [0, 1), usually from random_f32()
-    double norm = 0;
-    for (int i = 0; i < n; i++) {
-        norm += expf(logits[i]);
-    }
-    // instead of dividing all exp(logits), we can just multiply coin.
-    coin *= norm;
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += expf(logits[i]);
-        if (coin < cdf) {
-            return i;
-        }
-    }
-    return n - 1; // in case of rounding errors
-}
-
-// ----------------------------------------------------------------------------
-// Logger lite, will probably grow/change some over time
-
-typedef struct {
-    FILE *logfile;
-    int flush_every; // every how many steps to flush the log
-} Logger;
-
-void logger_init(Logger *logger, const char *filename) {
-    logger->flush_every = 20;
-    logger->logfile = NULL;
-    if (filename != NULL) { logger->logfile = fopenCheck(filename, "w"); }
-}
-
-void logger_log_val(Logger *logger, int step, float val_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d tel:%.4f\n", step, val_loss);
-    }
-}
-
-void logger_log_train(Logger *logger, int step, float train_loss) {
-    if (logger->logfile != NULL) {
-        fprintf(logger->logfile, "s:%d trl:%.4f\n", step, train_loss);
-        if (step % 10 == 0) { fflush(logger->logfile); }
-    }
-}
-
-void logger_free(Logger *logger) {
-    if (logger->logfile != NULL) { fclose(logger->logfile); }
+    float* cpu_buffer = (float*)mallocCheck(shard_num_parameters * sizeof(float));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    main_stream->memcpy(model->m_memory, cpu_buffer, shard_num_parameters * sizeof(float));
+    freadCheck(cpu_buffer, sizeof(float), shard_num_parameters, state_file);
+    main_stream->memcpy(model->v_memory, cpu_buffer, shard_num_parameters * sizeof(float));
+    free(cpu_buffer);
+    fclose(state_file);
 }
 
 // ----------------------------------------------------------------------------
 // CLI, poor man's argparse
+// unclaimed flags lol: k,p
 
 void error_usage() {
-    // default run = debugging run with TinyShakespeare
-    // bigger run = train on TinyStories! e.g. val/sample less often, but sample more tokens, write to logfile
     fprintf(stderr, "Usage:   ./train_gpt2cu [options]\n");
-    fprintf(stderr, "Example: ./train_gpt2cu -i data/TinyStories -v 100 -s 100 -g 144 -o stories.log\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -i <string> input dataset prefix (default = data/tiny_shakespeare)\n");
-    fprintf(stderr, "  -o <string> output log file (default = NULL)\n");
-    fprintf(stderr, "  -b <int>    batch size B (default = 4)\n");
+    // file system input / output
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input from model at this filename (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    // token layout for each step of the optimization
+    fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
-    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    // evaluation
     fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
-    fprintf(stderr, "  -m <int>    val_max_batches, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
     fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    // memory management
+    fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2465,91 +1438,168 @@ int main(int argc, char *argv[]) {
     multi_gpu_config = multi_gpu_config_init(&argc, &argv);
 
     // read in the (optional) command line arguments
-    const char* input_dataset_prefix = "data/tiny_shakespeare"; // or e.g. data/TinyStories
-    const char* output_log_file = NULL;
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
+    const char* output_log_dir = NULL;
+    int checkpoint_every = 0; // write optimization checkpoints every how many steps?
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
     int T = 1024; // sequence length max
+    int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
+    int warmup_iterations = 0;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
+    float weight_decay = 0.0f;
     int val_loss_every = 20; // every how many steps do we eval validation loss?
-    int val_max_batches = 20; // how many batches max do we eval for validation loss?
+    int val_max_steps = 20; // how many batches max do we eval for validation loss?
     int sample_every = 20; // every how many steps to do inference?
     int genT = 64; // number of steps of inference we will do
     int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
     int max_steps = -1;
     int override_enable_tf32 = 1;
     int use_master_weights = 1;
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
+    int hellaswag_eval = 0;
     for (int i = 1; i < argc; i+=2) {
         if (i + 1 >= argc) { error_usage(); } // must have arg after flag
         if (argv[i][0] != '-') { error_usage(); } // must start with dash
         if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
         // read in the args
-        if (argv[i][1] == 'i') { input_dataset_prefix = argv[i+1]; }
-        else if (argv[i][1] == 'o') { output_log_file = argv[i+1]; }
-        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU batch size
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
         else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
         else if (argv[i][1] == 'l') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_batches = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
         else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+    // should do a bit more error checking here
+    assert(warmup_iterations >= 0);
+    if (output_log_dir != NULL) {
+        assert(strlen(output_log_dir) < 400); // careful bunch of hardcoded snprintf around this
+    }
+    // check if output_log_dir does not exist or is a file
+    struct stat info;
+    if (output_log_dir != NULL && (stat(output_log_dir, &info ) != 0 || !(info.st_mode & S_IFDIR))) {
+        fprintf(stderr, "-o \"%s\" does not exist or is a file - are you specifying a file instead of dir?\n", output_log_dir);
+        exit(EXIT_FAILURE);
+    }
+    int tokens_per_fwdbwd = B * T * multi_gpu_config.num_processes; // one micro-batch processes this many tokens
+    // calculate sensible default for total batch size as assuming no gradient accumulation
+    if (total_batch_size == -1) { total_batch_size = tokens_per_fwdbwd; }
+    // calculate the number of gradient accumulation steps from the desired total batch size
+    assert(total_batch_size % tokens_per_fwdbwd == 0);
+    int grad_accum_steps = total_batch_size / tokens_per_fwdbwd;
+    // if we're only overfitting a single batch for debugging, let's overfit the first batch
+    // from val instead of train split, because val is smaller and faster. (train_gpt2.py does the same)
+    if (overfit_single_batch == 1) { train_data_pattern = val_data_pattern; }
     printf0("+-----------------------+----------------------------------------------------+\n");
     printf0("| Parameter             | Value                                              |\n");
     printf0("+-----------------------+----------------------------------------------------+\n");
-    printf0("| input dataset prefix  | %-50s |\n", input_dataset_prefix);
-    printf0("| output log file       | %-50s |\n", output_log_file == NULL ? "NULL" : output_log_file);
-    printf0("| batch size B          | %-50d |\n", B);
+    printf0("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf0("| val data pattern      | %-50s |\n", val_data_pattern);
+    printf0("| output log dir        | %-50s |\n", output_log_dir == NULL ? "NULL" : output_log_dir);
+    printf0("| checkpoint_every      | %-50d |\n", checkpoint_every);
+    printf0("| resume                | %-50d |\n", resume);
+    printf0("| micro batch size B    | %-50d |\n", B);
     printf0("| sequence length T     | %-50d |\n", T);
-    printf0("| learning rate         | %-50e |\n", learning_rate);
+    printf0("| total batch size      | %-50d |\n", total_batch_size);
+    printf0("| learning rate (LR)    | %-50e |\n", learning_rate);
+    printf0("| warmup iterations     | %-50d |\n", warmup_iterations);
+    printf0("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
+    printf0("| weight decay          | %-50e |\n", weight_decay);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
-    printf0("| val_max_batches       | %-50d |\n", val_max_batches);
+    printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
     printf0("| genT                  | %-50d |\n", genT);
     printf0("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf0("| recompute             | %-50d |\n", recompute);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // set up the device
+    // Setup the SYCL queue
     sycl::queue defaultQueue(sycl::gpu_selector_v, 
                             {sycl::property::queue::in_order{} /*,
                              sycl::property::queue::enable_profiling{} */ });
-    printf("Using device: %s\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
+    //printf("Using device: %s\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
     if (!defaultQueue.get_device().has(sycl::aspect::usm_device_allocations)) {
         std::cerr << "GPU does not support USM device allocations\n";
         return 1;
     }
-    DefaultQueue = &defaultQueue;
-    // Setup oneDNN engine and stream
-    auto engine = dnnl::sycl_interop::make_engine(DefaultQueue->get_device(), DefaultQueue->get_context());
-    auto stream = dnnl::sycl_interop::make_stream(engine, *DefaultQueue);
-    DefaultEngine = &engine;
-    DefaultStream = &stream;
 
-    // setup compute precision settings for cublas
-    // TF32 precision is equivalent to torch.set_float32_matmul_precision('high')
-    int enable_tf32 = 0;
-    
-    // set up cuDNN
-    #ifdef ENABLE_CUDNN
-    checkCudnnErr(cudnnCreate(&cudnn_handle));
-    #endif
-
+    common_start(override_enable_tf32, false); // common init code for train/test/profile
+    const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
+                              ? "FP32"
+                              : (PRECISION_MODE == PRECISION_FP16 ? "FP16" : "BF16");
     printf0("| device                | %-50s |\n", defaultQueue.get_device().get_info<sycl::info::device::name>().c_str());
-    printf0("| TF32                  | %-50s |\n", enable_tf32 ? "enabled" : "disabled");
-    printf0("| precision             | %-50s |\n", precision_mode_str);
+    //printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
+    printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // build the GPT-2 model from a checkpoint
+    // Set up queue ref and oneDNN stuff
+    main_stream = &defaultQueue;
+    auto engine = dnnl::sycl_interop::make_engine(main_stream->get_device(), main_stream->get_context());
+    auto dnnstream = dnnl::sycl_interop::make_stream(engine, *main_stream);
+    DefaultEngine = &engine;
+    DefaultStream = &dnnstream;
+
+    // figure out if we are going to be resuming the optimization
+    char filename_buffer[512];
+    int resuming = 0;
+    int resume_max_step = find_max_step(output_log_dir);
+    if (resume == 1) {
+        // find the DONE file with the highest step count
+        assert(output_log_dir != NULL);
+        if (resume_max_step == -1) {
+        } else {
+            resuming = 1;
+            snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, resume_max_step);
+        }
+    }
+
+    // build the GPT-2 model
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, load_filename);
+    // if load_filename is of the form "dX" where X is an integer (e.g. d12), then we build
+    // a random model with the depth of the model specified by X (e.g. 12). otherwise interpret
+    // this variable as a checkpoint filename, and load that checkpoint
+    assert(strlen(load_filename) >= 2);
+    if (resuming == 1) {
+        gpt2_build_from_checkpoint(&model, filename_buffer);
+    } else if (load_filename[0] == 'd') {
+        int depth = atoi(load_filename + 1);
+        if (depth > 1 && depth <= 1000) { // we're not going to train models this big right? heh
+            gpt2_build_from_random(&model, depth);
+        } else {
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        gpt2_build_from_checkpoint(&model, load_filename);
+    }
+
     model.use_master_weights = use_master_weights;
-    printf0("| load_filename         | %-50s |\n", load_filename);
+    model.recompute = recompute;
+    printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : (load_filename[0] == 'd' ? "random" : "OpenAI's GPT-2 checkpoint"));
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf0("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
@@ -2560,53 +1610,92 @@ int main(int argc, char *argv[]) {
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
-    char train_tokens_filename[128];
-    char val_tokens_filename[128];
-    assert(strlen(input_dataset_prefix) < 100); // being bit lazy here, make sure we don't overflow
-    // if we're only overfitting a single batch for debugging, let's overfit the first batch
-    // from val instead of train split, because val is smaller and a bit faster
-    const char* train_split = (overfit_single_batch == 1) ? "val" : "train";
-    sprintf(train_tokens_filename, "%s_%s.bin", input_dataset_prefix, train_split);
-    sprintf(val_tokens_filename, "%s_val.bin", input_dataset_prefix);
-    DataLoader train_loader;
-    dataloader_init(&train_loader, &multi_gpu_config, train_tokens_filename, B, T);
-    DataLoader val_loader;
-    dataloader_init(&val_loader, &multi_gpu_config, val_tokens_filename, B, T);
-    int train_num_batches = (max_steps == -1) ? train_loader.num_batches : max_steps; // default = 1 epoch
-    int val_num_batches = train_loader.num_batches < val_max_batches ? train_loader.num_batches : val_max_batches;
+    DataLoader train_loader, val_loader;
+    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    // figure out the number of training steps we will run for
+    int train_num_batches = max_steps; // passed in from command line
+    if (train_num_batches == -1) {
+        // sensible default is to train for exactly one epoch
+        size_t ntok = train_loader.num_tokens;
+        // the number of (outer loop) steps each process should take for us to reach one epoch
+        train_num_batches = ntok / total_batch_size;
+    }
+    // figure out the number of validation steps to run for
+    int val_num_batches = val_max_steps; // passed in from command line
+    if (val_num_batches == -1) {
+        // sensible default is to evaluate the full validation split
+        size_t ntok = val_loader.num_tokens;
+        // note that unlike the training loop, there is no gradient accumulation inner loop here
+        val_num_batches = ntok / tokens_per_fwdbwd;
+    }
     printf0("| train_num_batches     | %-50d |\n", train_num_batches);
     printf0("| val_num_batches       | %-50d |\n", val_num_batches);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
-    // pretty print in a table the multi-gpu configuration as well
-    printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
+    // build an EvalLoader for HellaSwag
+    EvalLoader eval_loader;
+    const char* hellaswag_path = "dev/data/hellaswag/hellaswag_val.bin";
+    const char hellaswag_available = access(hellaswag_path, F_OK) == 0;
+    const char run_hellaswag = hellaswag_eval && hellaswag_available;
+    if (run_hellaswag) {
+        evalloader_init(&eval_loader, hellaswag_path, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
+    printf0("| run hellaswag         | %-50s |\n", run_hellaswag ? "yes" : "no");
     printf0("+-----------------------+----------------------------------------------------+\n");
 
+    // pretty print in a table the multi-gpu configuration as well
+    set_zero_configs(&multi_gpu_config, zero_stage, model.num_parameters);
+    printf0("| num_processes         | %-50d |\n", multi_gpu_config.num_processes);
+    printf0("| zero_stage            | %-50d |\n", multi_gpu_config.zero_stage);
+    printf0("+-----------------------+----------------------------------------------------+\n");
+
+    // prints outside of pretty table to here and below
+    if (!hellaswag_available) {
+        printf0("HellaSwag eval not found at %s, skipping its evaluation\n", hellaswag_path);
+        printf0("You can run `python dev/data/hellaswag.py` to export and use it with `-h 1`.\n");
+    }
     // more prints related to allocations from gpt2_build_from_checkpoint down here to not mess up our table above
-    printf0("num_parameters: %zu ==> bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
+    printf0("num_parameters: %zu => bytes: %zu\n", model.num_parameters, model.num_parameters_bytes);
     printf0("allocated %d MiB for model parameters\n", (int)round(model.num_parameters_bytes / (1024 * 1024)));
+    // few more prints for gradient accumulation math up above
+    printf0("batch_size B=%d * seq_len T=%d * num_processes=%d and total_batch_size=%d\n",
+            B, T, multi_gpu_config.num_processes, total_batch_size);
+    printf0("=> setting grad_accum_steps=%d\n", grad_accum_steps);
 
-    // set up the Logger
+    // set up logging
+    create_dir_if_not_exists(output_log_dir);
     Logger logger;
-    logger_init(&logger, output_log_file);
+    logger_init(&logger, output_log_dir, multi_gpu_config.process_rank, resume);
 
-    // build the Tokenizer
+    // set up the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
     // some memory for generating samples from the model
-    unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
     floatX* cpu_logits_raw = (floatX*)mallocCheck(model.config.vocab_size * sizeof(floatX));
     float*  cpu_logits = (float*)mallocCheck(model.config.vocab_size * sizeof(float));
 
+    // if we found a checkpoint to resume from, load the optimization state
+    int step = 0;
+    if (resuming == 1) {
+        snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
+        load_state(&step, &model, &train_loader, filename_buffer);
+    }
+
     // train
-    struct timespec start, end;
+    //cudaEvent_t start, end;
+    //cudaCheck(cudaEventCreate(&start));
+    //cudaCheck(cudaEventCreate(&end));
+    //cudaCheck(cudaProfilerStart());
     double total_sum_iteration_time_s = 0.0;
-    for (int step = 0; step <= train_num_batches; step++) {
+    float ema_tokens_per_second = 0.0f;
+    for (; step <= train_num_batches; step++) {
+
         int last_step = step == train_num_batches;
 
-        // once in a while estimate the validation loss
+        // once in a while estimate the validation loss (all processes collaborate)
         if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
@@ -2616,13 +1705,34 @@ int main(int argc, char *argv[]) {
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
-            val_loss = multi_gpu_cpu_float_mean(val_loss, &multi_gpu_config);
+            val_loss = multi_gpu_cpu_float_sum(val_loss) / multi_gpu_config.num_processes;
             printf0("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while do model inference to print generated text
-        if (multi_gpu_config.process_rank == 0 && (step > 0 && (step % sample_every) == 0 || last_step)) {
+        // once in a while estimate HellaSwag accuracy (all processes collaborate)
+        if (run_hellaswag &&
+           ((step > 0 && step % val_loss_every == 0) || last_step)) {
+            float eval_acc_norm = 0.0f;
+            evalloader_reset(&eval_loader);
+            for (int i = 0; i < eval_loader.num_batches; i++) {
+                if (i % 10 == 0) { printf("evaluating HellaSwag: %d/%d\r", i, eval_loader.num_batches); }
+                evalloader_next_batch(&eval_loader);
+                gpt2_forward(&model, eval_loader.inputs, eval_loader.targets, B, T);
+                int correct = evalloader_stat_losses(&eval_loader, model.cpu_losses_fp32);
+                eval_acc_norm += (float)correct;
+            }
+            // careful because not all ranks may have the exact same allocation of number of examples
+            eval_acc_norm = multi_gpu_cpu_float_sum(eval_acc_norm);
+            printf0("HellaSwag: %d/%d = %f\n", (int)eval_acc_norm, eval_loader.num_examples, eval_acc_norm / eval_loader.num_examples);
+            logger_log_eval(&logger, step, eval_acc_norm / eval_loader.num_examples);
+        }
+
+        // once in a while do model inference to print generated text (only rank 0)
+        if (multi_gpu_config.process_rank == 0 && sample_every > 0 &&
+           (step > 0 && (step % sample_every) == 0 || last_step)) {
+            
+            unsigned long long sample_rng_state = 1337;
             // fill up gen_tokens with the <|endoftext|> token, which kicks off the generation
             int eot_token = tokenizer.eot_token;
             for(int i = 0; i < B * T; ++i) {
@@ -2631,6 +1741,7 @@ int main(int argc, char *argv[]) {
             // now sample from the model autoregressively
             printf("generating:\n---\n");
             for (int t = 1; t < genT; t++) {
+
                 // note that inference is very wasteful here because for each token
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
@@ -2642,13 +1753,13 @@ int main(int argc, char *argv[]) {
                 // get the V-dimensional vector probs[0, t-1, :]
                 floatX* logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
                 // move probs back to CPU and sample (note we only move the first vocab_size logits, ignoring the padding)
-                DefaultQueue->memcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX)).wait();
+                main_stream->memcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX)).wait();
                 // convert to FP32 into cpu_logits (this does nothing useful if floatX == float)
                 for (int i = 0; i < model.config.vocab_size; i++) {
                     cpu_logits[i] = (float)cpu_logits_raw[i];
                 }
-
-                float coin = random_f32(&rng_state);
+                // sample the next token
+                float coin = random_f32(&sample_rng_state);
                 int next_token = sample_softmax(cpu_logits, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
                 // print the generated token, either using the Tokenizer or a fallback
@@ -2664,55 +1775,123 @@ int main(int argc, char *argv[]) {
             printf("\n---\n");
         }
 
+        // once in a while checkpoint the optimization state (all ranks)
+        if ((checkpoint_every > 0 && output_log_dir != NULL && resuming == 0) &&
+            ((step > 0 && step % checkpoint_every == 0) || last_step)) {
+            assert(strlen(output_log_dir) < 400); // being a bit lazy here
+            // only rank 0 writes the model file because it is the same across all ranks
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(filename_buffer, 512, "%s/model_%08d.bin", output_log_dir, step);
+                gpt2_write_to_checkpoint(&model, filename_buffer);
+            }
+            // all ranks write their state file
+            snprintf(filename_buffer, 512, "%s/state_%08d_%05d.bin", output_log_dir, step, multi_gpu_config.process_rank);
+            save_state(filename_buffer, step, &model, &train_loader);
+            // DONE file is a signal that this checkpoint as a whole is complete
+            multi_gpu_barrier(&multi_gpu_config);
+            if (multi_gpu_config.process_rank == 0) {
+                snprintf(filename_buffer, 512, "%s/DONE_%08d", output_log_dir, step);
+                FILE* done_file = fopenCheck(filename_buffer, "w");
+                fclose(done_file);
+            }
+            multi_gpu_barrier(&multi_gpu_config);
+        }
+        resuming = 0;
+
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
         // instead of just < train_num_batches (one extra due to <=), only to do
         // the validation/sampling one last time, and then we break right here as we're done.
         if (last_step) { break; }
 
-        // do a training step
+        // --------------- TRAINING SECTION BEGIN -----------------
+        // do one training step, doing forward/backward/update on total_batch_size tokens
+        //cudaEventRecord(start);
+        struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
-        if (overfit_single_batch == 0 || (step == 0 && overfit_single_batch == 1)) {
-            // if we're overfitting a single batch, we'll only call this at step = 0
-            dataloader_next_batch(&train_loader);
+        // gradient accumulation loop over micro-batches
+        float lossf = 0.0f; // for getting the mean loss over the accumulation steps
+        for (int micro_step = 0; micro_step < grad_accum_steps; micro_step++) {
+            // fetch the next data batch
+            // and if we're overfitting a single batch, we'll only call this a single time
+            if (overfit_single_batch == 0 ||
+               (overfit_single_batch == 1 && step == 0 && micro_step == 0)) {
+                dataloader_next_batch(&train_loader);
+            }
+            // forward pass. note that we pass in grad_accum_steps, which scales down the loss
+            gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T, grad_accum_steps);
+            lossf += model.mean_loss; // the mean_loss was normalized by grad_accum_steps inside gpt2_forward
+            // backward pass. all model params accumulate gradients with += inside this inner loop
+            gpt2_backward(&model, train_loader.inputs);
         }
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        // override the mean loss, accounting for the gradient accumulation loop
+        // this is esp important to do here in multigpu update below, where model.mean_loss gets allreduced
+        model.mean_loss = lossf;
+        // average the loss and the gradients between all processes
+        gpt2_multi_gpu_loss_and_grad_reduce(&model, &multi_gpu_config);
+        // learning rate schedule: warmup linearly to max LR, then cosine decay to LR * final_learning_rate_frac
+        float step_learning_rate = learning_rate;
+        if (step < warmup_iterations) {
+            step_learning_rate = learning_rate * ((float)(step + 1)) / warmup_iterations;
+        } else {
+            float decay_ratio = ((float)(step - warmup_iterations)) / (train_num_batches - warmup_iterations);
+            assert(0.0f <= decay_ratio && decay_ratio <= 1.0f);
+            float coeff = 0.5f * (1.0f + cosf(M_PI * decay_ratio)); // coeff starts at 1 and goes to 0
+            assert(0.0f <= coeff && coeff <= 1.0f);
+            float min_lr = learning_rate * final_learning_rate_frac;
+            step_learning_rate = min_lr + coeff * (learning_rate - min_lr);
+        }
+        // update the model parameters
+        float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
+        gpt2_multi_gpu_param_gather(&model, &multi_gpu_config);
+        // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        if (multi_gpu_config.num_processes > 1) {
-            gpt2_multi_gpu_accumulate(&model, &multi_gpu_config);
-        }
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        DefaultQueue->wait(); // finish all SYCL work to get correct precise timings
+        // queue wait
         clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        double time_elapsed_ms = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e6;
+        //cudaCheck(cudaEventRecord(end));
+        //cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
+        // --------------- TRAINING SECTION END -------------------
+        // everything that follows now is just diagnostics, prints, logging, etc.
 
+        // todo - move or double-buffer all of this timing logic to avoid idling the GPU at this point!
+        //float time_elapsed_ms;
+        //cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, start, end));
+        size_t tokens_processed = (size_t)multi_gpu_config.num_processes * B * T * grad_accum_steps;
+        float tokens_per_second = tokens_processed / time_elapsed_ms * 1000.0f;
+        float bias_corrected_ema_tokens_per_second = tokens_per_second; // by default set to non-ema version
         if (step > 0) { // consider the first batch to be a warmup (e.g. cuBLAS/cuDNN initialisation)
-            total_sum_iteration_time_s += time_elapsed_s;
+            total_sum_iteration_time_s += time_elapsed_ms / 1000.0f;
+            // smooth out the tok/s with an exponential moving average, and bias correct just like in AdamW
+            ema_tokens_per_second = 0.95f * ema_tokens_per_second + 0.05f * tokens_per_second;
+            bias_corrected_ema_tokens_per_second = ema_tokens_per_second / (1.0f - powf(0.95f, step));
         }
-        int tokens_per_second = multi_gpu_config.num_processes * (B * T) / time_elapsed_s;
         float accumulated_loss = multi_gpu_config.num_processes == 1 ? model.mean_loss : model.accumulated_mean_loss;
-        printf0("step %4d/%d: train loss %f (acc %f) (%f ms, %d tok/s)\n", step + 1, train_num_batches, model.mean_loss, accumulated_loss, time_elapsed_s * 1000, tokens_per_second);
-        logger_log_train(&logger, step, model.mean_loss);
+        float mfu = gpt2_estimate_mfu(&model, B * T * grad_accum_steps, time_elapsed_ms / 1000.0f);
+        printf0("step %4d/%d | train loss %7.6f | norm %6.4f | lr %.2e | %.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+                step + 1, train_num_batches, accumulated_loss, grad_norm, step_learning_rate,
+                time_elapsed_ms, 100*mfu, bias_corrected_ema_tokens_per_second);
+        logger_log_train(&logger, step, model.mean_loss, step_learning_rate, grad_norm);
+
+        // disable the profiler after 3 steps of optimization
+        // if (step == 3) { cudaProfilerStop(); }
     }
     // add a total average, for optimizations that are only mild improvements (excluding 1st batch as warmup)
     printf0("total average iteration time: %f ms\n", total_sum_iteration_time_s / (train_num_batches-1) * 1000);
 
     // free and destroy everything
+    //cudaCheck(cudaEventDestroy(end));
+    //cudaCheck(cudaEventDestroy(start));
+    if (run_hellaswag) { evalloader_free(&eval_loader); }
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    gpt2_free(&model);
     free(cpu_logits_raw);
     free(cpu_logits);
     free(gen_tokens);
-    #ifdef ENABLE_CUDNN
-    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
-    checkCudnnErr(cudnnDestroy(cudnn_handle));
-    #endif
-    logger_free(&logger);
     multi_gpu_config_free(&multi_gpu_config);
-
+    gpt2_free(&model);
+    common_free(model);
     return 0;
 }
 #endif

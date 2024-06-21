@@ -218,3 +218,7 @@ Ways of organizing development:
 ## license
 
 MIT
+
+## Copilot Disclaimer
+
+The SYCL code used Github Copilot as basically a smart autocomplete.

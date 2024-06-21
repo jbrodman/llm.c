@@ -33,14 +33,11 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
+#define ENABLE_BF16
 #include "common.h"
 
 // namespace alias
 namespace dnnlsycl = dnnl::sycl_interop;
-
-// ----------------------------------------------------------------------------
-// Floating point precision setup
-typedef sycl::half floatX; // half or __nv_bfloat16 (or float)
 
 // ----------------------------------------------------------------------------
 // CUDA & cuDNN setup
@@ -208,15 +205,15 @@ void softmax_forward_kernel4(sycl::nd_item<1> id, float* out, const float* inp, 
     // each row of C elements is handled by block_size threads
     // furthermore, each block_size threads get executed in warps of 32 threads
 
-    int idx = id.get_group(0);
-    int tid = id.get_local_linear_id();
+    int idx = blockIdx_x(id);
+    int tid = threadIdx_x(id);
   
     // one row of inp, i.e. inp[idx, :] of shape (C,)
     const float* x = inp + idx * C;
 
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += id.get_local_range(0)) {
+    for (int i = tid; i < C; i += blockDim_x(id)) {
         maxval = sycl::fmax(maxval, x[i]);
     }
     maxval = sycl::reduce_over_group(id.get_group(), maxval, sycl::maximum<float>());
@@ -225,7 +222,7 @@ void softmax_forward_kernel4(sycl::nd_item<1> id, float* out, const float* inp, 
     float offset = maxval; 
 
     // compute expf and write the result to global memory
-    for (int i = tid; i < C; i += id.get_local_range(0)) {
+    for (int i = tid; i < C; i += blockDim_x(id)) {
         out[idx * C + i] = sycl::exp(x[i] - offset);
     }
 
@@ -235,7 +232,7 @@ void softmax_forward_kernel4(sycl::nd_item<1> id, float* out, const float* inp, 
     // thread coarsening for sum
     x = out + idx * C;
     float sumval = 0.0f;
-    for (int i = tid; i < C; i += id.get_local_range(0)) {
+    for (int i = tid; i < C; i += blockDim_x(id)) {
         sumval += x[i];
     }
     sumval = sycl::reduce_over_group(id.get_group(), sumval, sycl::plus<float>());
@@ -244,7 +241,7 @@ void softmax_forward_kernel4(sycl::nd_item<1> id, float* out, const float* inp, 
     float sum = sumval;
 
     // divide the whole row by the sum
-    for (int i = tid; i < C; i += id.get_local_range(0)) {
+    for (int i = tid; i < C; i += blockDim_x(id)) {
         out[idx * C + i] = x[i] / sum;
     }
 }
@@ -265,7 +262,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     // uses the online softmax algorithm
     assert(T % 4  == 0);
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int idx = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
     if(idx >= N * T) {
         return;
     }
@@ -280,7 +277,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     float sumval = 0.0f;
 
     const sycl::float4* x_vec = reinterpret_cast<const sycl::float4*>(x);
-    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i < pos_by_4; i += size(warp)) {
         sycl::float4 v = x_vec[i];
         float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
@@ -292,11 +289,11 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
         }
     }
 
-    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+    if(4*pos_by_4 + thread_rank(warp) <= own_pos) {
         float old_maxval = maxval;
-        maxval = sycl::fmax(maxval, x[4*pos_by_4 + warp.get_local_linear_id()]);
+        maxval = sycl::fmax(maxval, x[4*pos_by_4 + thread_rank(warp)]);
         sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
-        sumval += sycl::exp(inv_temperature * (x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+        sumval += sycl::exp(inv_temperature * (x[4*pos_by_4 + thread_rank(warp)] - maxval));
     }
 
     float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>{});
@@ -306,7 +303,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, float* out, float inv_temperat
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i <= own_pos; i += size(warp)) {
         // recalculation is faster than doing the round-trip through memory.
         // Fix this later
         // float ev = sycl::exp(inv_temperature * (__ldcs(x + i) - global_maxval));
@@ -362,15 +359,14 @@ void attention_forward_kernel2(
     float* O,
     sycl::local_accessor<float> local_sram
 ) {
-    int tx = id.get_local_id(1); //threadIdx.x;
-//    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
-    int bx = id.get_group(1); int by = id.get_group(0);  // batch and head index
+    int tx = threadIdx_x(id);
+    int bx = blockIdx_x(id); int by = blockIdx_y(id);  // batch and head index
 
     // Offset into Q,K,V,O,l,m - different for each batch and head
     //int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
     //int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
-    int qkv_offset = (bx * id.get_group_range(0) * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * id.get_group_range(0) * N) + (by * N);  // offset for l and m
+    int qkv_offset = (bx * gridDim_y(id) * N * d) + (by * N * d);  // gridDim.y = nh
+    int lm_offset = (bx * gridDim_y(id) * N) + (by * N);  // offset for l and m
 
     // Define SRAM for Q,K,V,S
     int tile_size = Bc * d;  // size of Qi, Kj, Vj
@@ -528,6 +524,80 @@ void scale_kernel(sycl::nd_item<1> id, float* inp, float scale, int B, int NH, i
     }
 }
 
+// direct translation of the CPU kernel. Each warp handles ont (b, h, t) combination.
+// The important changes compared to the CPU version:
+//  - each inner loop is handled by a warp
+//  - don't write non-autoregressive parts
+//  - reordered the last loops so that we can do all writing in the outer loop.
+void attention_forward_fused1(sycl::nd_item<3> id, float* out, float* preatt, float* att,
+                                         const float* inp,
+                                         int B, int T, int C, int NH) {
+    // input is (B, T, 3C) Q,K,V
+    // preatt, att are (B, NH, T, T)
+    // output is (B, T, C)
+    int C3 = C*3;
+    int hs = C / NH; // head size
+    float scale = 1.0 / sqrtf(hs);
+
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int t = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
+    int h = blockIdx_y(id);
+    int b = blockIdx_z(id);
+
+    if(t >= T) return;
+
+    const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+    float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+    float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+
+    // pass 1: calculate query dot key and maxval
+    float maxval = -INFINITY;
+    for (int t2 = 0; t2 <= t; t2++) {
+        const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+
+        // (query_t) dot (key_t2)
+        float val = 0.0f;
+        for (int i = thread_rank(warp); i < hs; i += size(warp)) {
+            val += query_t[i] * key_t2[i];
+        }
+        val = sycl::reduce_over_group(warp, val, sycl::plus<float>{});
+        val *= scale;
+        maxval = sycl::max(maxval, val);
+        if(thread_rank(warp) == 0) {
+            preatt_bth[t2] = val;
+        }
+    }
+
+    // pass 2: calculate the exp and keep track of sum
+    float expsum = 0.0f;
+    for (int t2 = thread_rank(warp); t2 <= t; t2 += size(warp)) {
+        float expv = sycl::exp(preatt_bth[t2] - maxval);
+        expsum += expv;
+    }
+
+    expsum = sycl::reduce_over_group(warp, expsum, sycl::plus<float>{});
+
+    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+    // pass 3: normalize to get the softmax is combined with the next loop to reduce memory round-trips
+    for (int t2 = thread_rank(warp); t2 <= t; t2 += size(warp)) {
+        att_bth[t2] = sycl::exp(preatt_bth[t2] - maxval) * expsum_inv;
+    }
+
+    // pass 4: accumulate weighted values into the output of attention
+    float* out_bth = out + b * T * C + t * C + h * hs;
+    for (int i = thread_rank(warp); i < hs; i += size(warp)) {
+        float o = 0.f;
+        for (int t2 = 0; t2 <= t; t2++) {
+            const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2; // +C*2 because it's value
+            float att_btht2 = att_bth[t2];
+            o += att_btht2 * value_t2[i];
+        }
+        out_bth[i] = o;
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -579,12 +649,8 @@ void attention_forward2(float* out,
     // create some temporary memory
     float* l;
     float* m;
-    l = sycl::malloc_device<float>(B * nh * N, queue);
-    m = sycl::malloc_device<float>(B * nh * N, queue);
-
-    syclMallocCheck(l);
-    syclMallocCheck(m);
-
+    syclMallocCheck(l = sycl::malloc_device<float>(B * nh * N, queue));
+    syclMallocCheck(m = sycl::malloc_device<float>(B * nh * N, queue));
     queue.memset(l, 0, B * nh * N * sizeof(float));
     queue.memset(m, -10000.0f, B * nh * N * sizeof(float));
 
@@ -613,13 +679,9 @@ void attention_forward2(float* out,
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
     // so we have to permute the tensor using a kernel with block_size
     float *q, *k, *v;
-    q = sycl::malloc_device<float>(B * T * C, queue);
-    k = sycl::malloc_device<float>(B * T * C, queue);
-    v = sycl::malloc_device<float>(B * T * C, queue);
-
-    syclMallocCheck(q);
-    syclMallocCheck(k);
-    syclMallocCheck(v);
+    syclMallocCheck(q = sycl::malloc_device<float>(B * T * C, queue));
+    syclMallocCheck(k = sycl::malloc_device<float>(B * T * C, queue));
+    syclMallocCheck(v = sycl::malloc_device<float>(B * T * C, queue));
 
     int total_threads = B * N * nh * d;
     int num_blocks = ceil_div(total_threads, block_size);
@@ -850,7 +912,7 @@ void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_te
     // uses the online softmax algorithm
     assert(T % 4  == 0);
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int idx = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
     if(idx >= N * T) {
         return;
     }
@@ -865,7 +927,7 @@ void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_te
     float sumval = 0.0f;
 
     // Same thing but without float4, one at a time
-    for (int i = warp.get_local_linear_id(); i < pos_by_4; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i < pos_by_4; i += size(warp)) {
         float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
             maxval = sycl::fmax(maxval, (float)x[4*i + k]);
@@ -876,11 +938,11 @@ void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_te
         }
     }
 
-    if(4*pos_by_4 + warp.get_local_linear_id() <= own_pos) {
+    if(4*pos_by_4 + thread_rank(warp) <= own_pos) {
         float old_maxval = maxval;
-        maxval = sycl::fmax(maxval, (float)x[4*pos_by_4 + warp.get_local_linear_id()]);
+        maxval = sycl::fmax(maxval, (float)x[4*pos_by_4 + thread_rank(warp)]);
         sumval *= sycl::exp(inv_temperature * (old_maxval - maxval));
-        sumval += sycl::exp(inv_temperature * ((float)x[4*pos_by_4 + warp.get_local_linear_id()] - maxval));
+        sumval += sycl::exp(inv_temperature * ((float)x[4*pos_by_4 + thread_rank(warp)] - maxval));
     }
 
     float global_maxval = sycl::reduce_over_group(warp, maxval, sycl::maximum<float>());
@@ -890,7 +952,7 @@ void softmax_forward_kernel5_lowp(sycl::nd_item<1> id, floatX* out, float inv_te
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.get_local_linear_id(); i <= own_pos; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i <= own_pos; i += size(warp)) {
         // recalculation is faster than doing the round-trip through memory.
         // Fix this later
         //float ev = sycl::exp(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
@@ -978,9 +1040,9 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
     auto stream = dnnlsycl::make_stream(engine, queue);
 
     // Create memory descriptors
-    auto q_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
-    auto k_md = dnnl::memory::desc({B * NH, HS, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::acb);
-    auto preatt_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+    auto q_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::abc);
+    auto k_md = dnnl::memory::desc({B * NH, HS, T}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::acb);
+    auto preatt_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::abc);
 
     // Create memory objects
     auto q_mem = dnnlsycl::make_memory(q_md, engine, dnnlsycl::memory_kind::usm, q);
@@ -1010,9 +1072,9 @@ void attention_forward5(float* out, floatX* vaccum, floatX* qkvr, floatX* preatt
 
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    auto att_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);  
-    auto v_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
-    auto vaccum_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::f16, dnnl::memory::format_tag::abc);
+    auto att_md = dnnl::memory::desc({B * NH, T, T}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::abc);  
+    auto v_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::abc);
+    auto vaccum_md = dnnl::memory::desc({B * NH, T, HS}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::abc);
 
     // Create memory objects
     auto att_mem = dnnlsycl::make_memory(att_md, engine, dnnlsycl::memory_kind::usm, att);
@@ -1105,26 +1167,18 @@ int main(int argc, char **argv) {
 
     // move to GPU
     float* d_out;
-    float* d_stats = nullptr; // for cuDNN
+    float* d_stats; // for cuDNN
     float* d_vaccum;
     float* d_qkvr;
     float* d_preatt;
     float* d_att;
     float* d_inp;
-    d_out = sycl::malloc_device<float>(B * T * C, defaultQueue);
-    d_vaccum = sycl::malloc_device<float>(B * T * C, defaultQueue);
-    d_qkvr = sycl::malloc_device<float>(B * T * 3 * C, defaultQueue);
-    d_preatt = sycl::malloc_device<float>(B * NH * T * T, defaultQueue);
-    d_att = sycl::malloc_device<float>(B * NH * T * T, defaultQueue);
-    d_inp = sycl::malloc_device<float>(B * T * 3 * C, defaultQueue);
-
-    syclMallocCheck(d_out);
-    syclMallocCheck(d_vaccum);
-    syclMallocCheck(d_qkvr);
-    syclMallocCheck(d_preatt);
-    syclMallocCheck(d_att);
-    syclMallocCheck(d_inp);
-    
+    syclMallocCheck(d_out = sycl::malloc_device<float>(B * T * C, defaultQueue));
+    syclMallocCheck(d_vaccum = sycl::malloc_device<float>(B * T * C, defaultQueue));
+    syclMallocCheck(d_qkvr = sycl::malloc_device<float>(B * T * 3 * C, defaultQueue));
+    syclMallocCheck(d_preatt = sycl::malloc_device<float>(B * NH * T * T, defaultQueue));
+    syclMallocCheck(d_att = sycl::malloc_device<float>(B * NH * T * T, defaultQueue));
+    syclMallocCheck(d_inp = sycl::malloc_device<float>(B * T * 3 * C, defaultQueue));
     defaultQueue.memcpy(d_inp, inp, B * T * 3 * C * sizeof(float));
 
     // read kernel_num from command line
@@ -1161,6 +1215,7 @@ int main(int argc, char **argv) {
         }
     }
     printf("All results match. Starting benchmarks.\n\n");
+    first_run_validation = false;
 
     // benchmark speed of the kernel
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {

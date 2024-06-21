@@ -98,7 +98,7 @@ SoftmaxParams prepare_softmax(sycl::sub_group warp,
     float maxval = -INFINITY;
     float sumval = 0.0f;
 
-    for (int i = warp.get_local_linear_id(); i < V; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i < V; i += size(warp)) {
         float v = x[i];
         float old_maxval = maxval;
         // online softmax recurrence from "Online normalizer calculation for softmax" paper
@@ -124,7 +124,7 @@ void fused_classifier_kernel1(sycl::nd_item<1> id, float* dlogits, float* losses
                              const float* logits, const float* dlosses, const int* targets,
                              int B, int T, int V, int P) {
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0) * warp.get_group_linear_range() + warp.get_group_linear_id();
+    int idx = blockIdx_x(id) * meta_group_size(warp) + meta_group_rank(warp);
     if (idx >= B * T) {
         return;
     }
@@ -145,7 +145,7 @@ void fused_classifier_kernel1(sycl::nd_item<1> id, float* dlogits, float* losses
     // finally all threads calculate the gradients
     // prob is only materialized here temporarily and in registers, never
     // as a full tensor that gets written to global memory
-    for (int i = warp.get_local_linear_id(); i < V; i += warp.get_max_local_range()[0]) {
+    for (int i = thread_rank(warp); i < V; i += size(warp)) {
         float prob = sycl::exp(logits[idx * P + i] - sp.Offset) * sp.Scale;
         float* dlogits_bt = dlogits + b * T * P + t * P;
         float dloss = dlosses[b * T + t];
@@ -169,7 +169,7 @@ SoftmaxParams prepare_softmax_blockwide(sycl::nd_item<1> id, sycl::sub_group& wa
     float thread_sumval = 0.0f;
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = (V+3)/4 + id.get_local_linear_id() - id.get_local_range(0); i >= 0; i -= id.get_local_range(0)) {
+    for (int i = (V+3)/4 + threadIdx_x(id) - blockDim_x(id); i >= 0; i -= blockDim_x(id)) {
         sycl::float4 v4 = x_vec4[i];
         #pragma unroll
         for(int k = 0; k < 4; k++) {
@@ -199,7 +199,7 @@ void fused_classifier_kernel2(sycl::nd_item<1> id, float* dlogits, float* losses
                               const float* logits, const float* dlosses, const int* targets,
                               int B, int T, int V, int P) {
     sycl::sub_group warp = id.get_sub_group();
-    int idx = id.get_group(0);
+    int idx = blockIdx_x(id);
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -251,7 +251,7 @@ SoftmaxParams prepare_softmax_blockwide_nofloat4(sycl::nd_item<1> id,
     float thread_sumval = 0.0f; 
     // do the loop in reverse to maximise probability of L2 cache hits
     // so even small L2s get some hits on the 2nd read of the same thread
-    for (int i = V + id.get_local_linear_id() - id.get_local_range(0); i >= 0; i -= id.get_local_range(0)) {
+    for (int i = V + threadIdx_x(id) - blockDim_x(id); i >= 0; i -= blockDim_x(id)) {
         float v = x[i];
         float old_maxval = thread_maxval;
         thread_maxval = sycl::fmax(thread_maxval, v);
@@ -271,7 +271,7 @@ SoftmaxParams prepare_softmax_blockwide_nofloat4(sycl::nd_item<1> id,
 void fused_classifier_kernel3(sycl::nd_item<1> id, float* dlogits, float* losses, float* probs,
                               const float* logits, const float* dlosses, const int* targets,
                               int B, int T, int V, int P) {
-    int idx = id.get_group(0); 
+    int idx = blockIdx_x(id); 
     int ix = targets[idx];
 
     // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
@@ -288,7 +288,7 @@ void fused_classifier_kernel3(sycl::nd_item<1> id, float* dlogits, float* losses
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const float* logits_vec = logits + idx * P;
-    for (int i = id.get_local_linear_id(); i < V; i += id.get_local_range(0)) {
+    for (int i = threadIdx_x(id); i < V; i += blockDim_x(id)) {
         // this is the 2nd read of logits after the one in prepare_softmax2
         // this data will never be needed again, so we reduce cache persistence
         // Fix this later
@@ -304,6 +304,196 @@ void fused_classifier_kernel3(sycl::nd_item<1> id, float* dlogits, float* losses
         }
     }
 }
+
+SoftmaxParams prepare_softmax_blockwide2(sycl::nd_item<1> id, int64_t idx, const floatX* inp, int V, int P) {
+    // one row of inp, i.e. inp[idx, :] of shape (V,)
+
+    const floatX* x = inp + idx * P;
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    // do the loop in reverse to maximise probability of L2 cache hits
+    // so even small L2s get some hits on the 2nd read of the same thread
+    for (int i = ceil_div(V, x128::size) + threadIdx_x(id) - blockDim_x(id); i >= 0; i -= blockDim_x(id)) {
+        x128 packed_x = load128cs(x + i * x128::size); // load and do not keep in cache
+        for(int k = 0; k < packed_x.size; ++k) {
+            if (i*x128::size+k >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = (float)packed_x[k];
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf(old_maxval - thread_maxval);
+            thread_sumval += expf(v - thread_maxval);
+        }
+    }
+
+    // reduce maxval within each block
+    float block_maxval = sycl::reduce_over_group(id.get_group(), thread_maxval, sycl::maximum<float>{});
+    // each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    // reduce sumval across the block
+    float block_sumval = sycl::reduce_over_group(id.get_group(), thread_sumval, sycl::plus<float>{}); 
+    // return the softmax parameters
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
+}
+
+// same as 2 but using x128
+void fused_classifier_kernel4(sycl::nd_item<1> id, floatX* dlogits, floatX* losses, floatX* probs,
+                                         const floatX* logits, const floatX* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
+    int64_t idx = blockIdx_x(id);
+    int ix = targets[idx];
+
+    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    SoftmaxParams sp = prepare_softmax_blockwide2(id, idx, logits, V, P);
+
+    // calculate the probability needed for the loss and update (single-threaded)
+    if(threadIdx_x(id) == 0) {
+        float prob = sycl::exp((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
+        losses[idx] = -sycl::log(prob);
+    }
+
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = dlosses != NULL ? (float)dlosses[idx] : 1.0f / (B*T);
+    // calculate the gradients directly, saves bandwidth from probs during training
+    // but also supports writing probs for inference-only and debugging
+    const floatX* logits_vec = logits + idx * P;
+    for (int i = threadIdx_x(id); i < ceil_div(V , x128::size); i += blockDim_x(id)) {
+        // this is the 2nd read of logits after the one in prepare_softmax2
+        // this data will never be needed again, so we reduce cache persistence
+        x128 packed_logits_vec = load128cs(logits_vec + i * x128::size); // load and do not keep in cache
+        x128 packed_probs;
+        x128 packed_dlogits;
+        for(int k = 0; k < packed_logits_vec.size; ++k) {
+            int element = i*packed_logits_vec.size + k;
+            if (element >= V) {  // bounds checking against real V
+                continue;
+            }
+            float v = packed_logits_vec[k];
+            float prob = expf(v - sp.Offset) * sp.Scale;
+            packed_probs[k] = prob;
+            float indicator = (element == ix) ? 1.0f : 0.0f;
+            packed_dlogits[k] = (prob - indicator) * dloss;
+        }
+        // Note: missing .cs hint hurts our performance due to cache thrashing, fixed in kernel5
+        store128(dlogits + idx * P + i * packed_logits_vec.size, packed_dlogits);
+        if (probs != NULL) {
+            store128(probs + idx * P + i * packed_logits_vec.size, packed_probs);
+        }
+    }
+}
+
+SoftmaxParams prepare_softmax_blockwide3(sycl::nd_item<1> id, int64_t idx, const floatX* inp, int V, int P) {
+    // same but not float4
+    // one row of inp, i.e. inp[idx, :] of shape (V,)
+
+    const floatX* x = inp + idx * P;
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    int i = (V+x128::size-1)/x128::size + threadIdx_x(id) - blockDim_x(id);
+
+    // special-case loop to handle the unaligned elements at the end of the array
+    // this lets us skip the bounds check in the main loop below, which improves performance
+    while ((i+1)*x128::size > V) {
+        for(int k = 0; k < x128::size; ++k) {
+            if (i*x128::size+k >= V) {
+                break; // bounds checking against real V (rather than padded P)
+            }
+            float v = (float)x[i*x128::size+k];
+            float old_maxval = thread_maxval;
+            thread_maxval = sycl::fmax(thread_maxval, v);
+            thread_sumval *= sycl::exp((old_maxval - thread_maxval));
+            thread_sumval += sycl::exp(v - thread_maxval);
+        }
+        i -= blockDim_x(id);
+    }
+
+    // main loop for the bulk of the iterations (no bounds checking required!)
+    for (; i >= 0; i -= blockDim_x(id)) {
+        x128 packed_x = load128(x + i * x128::size); // load and keep in cache until fused_classifier loop
+        for(int k = 0; k < x128::size; ++k) {
+            float v = (float)packed_x[k];
+            float old_maxval = thread_maxval;
+            thread_maxval = sycl::fmax(thread_maxval, v);
+            thread_sumval *= sycl::exp((old_maxval - thread_maxval));
+            thread_sumval += sycl::exp(v - thread_maxval);
+        }
+    }
+
+    // Block Max Reduction -> Maths -> Block Sum Reduction
+    float block_maxval = sycl::reduce_over_group(id.get_group(), thread_maxval, sycl::maximum<float>{});
+    thread_sumval *= sycl::exp(thread_maxval - block_maxval);
+    float block_sumval = sycl::reduce_over_group(id.get_group(), thread_sumval, sycl::plus<float>{});
+    
+    // return the softmax parameters
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
+}
+
+// will _update_ logits to logit gradients
+// uses template to decide whether to write logits and probs
+// split both loops in "multiple-of-x128-size" and "bounds-checked remainder" parts
+template <bool WriteLogits = true, bool WriteProbs = false>
+void 
+                fused_classifier_kernel5(sycl::nd_item<1> id, floatX* dlogits, floatX* losses, floatX* probs,
+                                         const floatX* logits, const floatX* dlosses, const int* targets,
+                                         int B, int T, int V, int P) {
+    int64_t idx = blockIdx_x(id);
+    int ix = targets[idx];
+
+    // softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    SoftmaxParams sp = prepare_softmax_blockwide3(id, idx, logits, V, P);
+
+    // calculate the probability needed for the loss and update (single-threaded)
+    if(threadIdx_x(id) == 0) {
+        float prob = sycl::exp((float)logits[idx * P + ix] - sp.Offset) * sp.Scale;
+        losses[idx] = (floatX)(-sycl::log(prob));
+    }
+
+    // very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    float dloss = (dlosses != NULL) ? (float)dlosses[idx] : 1.0f / (B*T);
+    // calculate the gradients directly, saves bandwidth from probs during training
+    // but also supports writing probs for inference-only and debugging
+    const floatX* logits_vec = logits + idx * P;
+    for (int i = threadIdx_x(id); i < V/x128::size; i += blockDim_x(id)) {
+        // this is the 2nd read of logits after the one in prepare_softmax2
+        // it will be overwritten by the logits gradients which is when we reduce cache persistence
+        x128 packed_logits_vec = load128(logits_vec + i * x128::size); // rely on cs of store128cs
+        x128 packed_probs;
+        for(int k = 0; k < x128::size; ++k) {
+            int element = i*x128::size + k;
+            float prob = sycl::exp((float)packed_logits_vec[k] - sp.Offset) * sp.Scale;
+            packed_probs[k] = (floatX)prob;
+            float indicator = (element == ix) ? 1.0f : 0.0f;
+            packed_logits_vec[k] = (floatX)((prob - indicator) * dloss);
+        }
+        if (WriteLogits){
+            // reduce cache persistence for the overwritten logits
+            // to maximise probability that logits remain in cache between prepare_softmax and here
+            store128cs(dlogits + idx * P + i * x128::size, packed_logits_vec);
+        }
+        if (WriteProbs) {
+            store128(probs + idx * P + i * x128::size, packed_probs);
+        }
+    }
+
+    // handle remaining elements after the last multiple of x128::size
+    // e.g. if V = 8003, and x128::size = 8, we need to handle the last 3 elements
+    int unaligned_start = V & ~(x128::size - 1); // round down to multiple of x128::size
+    for (int i = threadIdx_x(id) + unaligned_start; i < V; i++) {
+        float prob = sycl::exp((float)logits_vec[i] - sp.Offset) * sp.Scale;
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (prob - indicator) * dloss;
+        if (WriteLogits){
+            // Fix this later
+            // __stcs(dlogits + idx * P + i, (floatX)dlogit);
+            dlogits[idx * P + i] = (floatX)dlogit;
+        }
+        if (WriteProbs) {
+            probs[idx * P + i] = (floatX)prob;
+        }
+    }
+}
+
 
 // ----------------------------------------------------------------------------
 // kernel launcher
@@ -342,6 +532,26 @@ void fused_classifier3(float* dlogits, float* losses,
     });
 }
 
+void fused_classifier4(float* dlogits, float* losses,
+                      const float* logits, const float* dlosses, const int* targets,
+                      int B, int T, int V, int P, int block_size) {
+    const int N = B * T;
+    const int grid_size = N;
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        fused_classifier_kernel4(id, (floatX*)dlogits, (floatX*)losses, NULL, (floatX*)logits, (floatX*)dlosses, targets, B, T, V, P);
+    });
+}
+
+void fused_classifier5(float* dlogits, float* losses,
+                      const float* logits, const float* dlosses, const int* targets,
+                      int B, int T, int V, int P, int block_size) {
+    const int N = B * T;
+    const int grid_size = N;
+    DefaultQueue->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        fused_classifier_kernel5<true,false>(id, (floatX*)dlogits, (floatX*)losses, NULL, (floatX*)logits, (floatX*)dlosses, targets, B, T, V, P);
+    });
+}
+
 void fused_classifier(int kernel_num, float* dlogits, float* losses,
                       const float* logits, const float* dlosses, const int* targets,
                       int B, int T, int V, int P, int block_size) {
@@ -354,6 +564,12 @@ void fused_classifier(int kernel_num, float* dlogits, float* losses,
             break;
         case 3:
             fused_classifier3(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
+            break;
+        case 4:
+            fused_classifier4(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
+            break;
+        case 5:
+            fused_classifier5(dlogits, losses, logits, dlosses, targets, B, T, V, P, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
@@ -430,20 +646,25 @@ int main(int argc, char **argv) {
     crossentropy_forward_cpu(losses, probs, targets, B, T, V);
     crossentropy_softmax_backward_cpu(dlogits, dlosses, probs, targets, B, T, V);
 
-    // time the kernel at different block sizes
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-        printf("Checking block size %d.\n", block_size);
-        fused_classifier(kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets, B, T, V, P, block_size);
-        // Adjust tolerance for now - running into weird fp stuff.
-        validate_result(d_losses, losses, "losses", B * T, 1e-3f);
-        // undo the padding before we can check for correctness
-        defaultQueue.ext_oneapi_memcpy2d(d_dlogits_no_pad, V * sizeof(float), d_dlogits, P * sizeof(float), V * sizeof(float), B * T);
-        defaultQueue.wait();
-        // Adjust tolerance for now - running into weird fp stuff.
-        validate_result(d_dlogits_no_pad, dlogits, "dlogits", B * T * V, 1e-3f);
+#if defined(ENABLE_BF16) || defined(ENABLE_FP16)
+    if (kernel_num < 4) // kernel 4/5 + BF16 is only for testing performance, it doesn't do the format conversions yet etc...
+#endif
+    {
+        // time the kernel at different block sizes
+        for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+            int block_size = block_sizes[j];
+            printf("Checking block size %d.\n", block_size);
+            fused_classifier(kernel_num, d_dlogits, d_losses, d_logits, d_dlosses, d_targets, B, T, V, P, block_size);
+            // Adjust tolerance for now - running into weird fp stuff.
+            validate_result(d_losses, losses, "losses", B * T, 1e-3f);
+            // undo the padding before we can check for correctness
+            defaultQueue.ext_oneapi_memcpy2d(d_dlogits_no_pad, V * sizeof(float), d_dlogits, P * sizeof(float), V * sizeof(float), B * T);
+            defaultQueue.wait();
+            // Adjust tolerance for now - running into weird fp stuff.
+            validate_result(d_dlogits_no_pad, dlogits, "dlogits", B * T * V, 1e-3f);
+        }
+        printf("All results match. Starting benchmarks.\n\n");
     }
-    printf("All results match. Starting benchmarks.\n\n");
 
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];

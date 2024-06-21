@@ -83,9 +83,9 @@ void matmul_backward_bias_kernel_naive(sycl::nd_item<1> id, float* dbias, const 
 
 // use shared memory and coarsening + reductions
 void matmul_backward_bias_kernel_faster(sycl::nd_item<1> id, float* dbias, const float* dout, int B, int T, int OC) {
-    int o = id.get_group(0); // range [0, OC)
-    int tid = id.get_local_linear_id(); // range [0, block_size)
-    int block_size = id.get_local_range(0);
+    int o = blockIdx_x(id); // range [0, OC)
+    int tid = threadIdx_x(id); // range [0, block_size)
+    int block_size = blockDim_x(id);
     const float* x = dout + o;
     // thread coarsening
     // nix the double

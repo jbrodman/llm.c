@@ -68,30 +68,38 @@ static float* d_qkvr;   // scratch for the cublas kernel
 // taken from then attention forward pass
 void trimul_cpu(float* out, const float* inp,
                 int B, int T, int C, int NH) {
+    // inp shape: (B, T, 3, NH, HS)
+    // out shape: (B, NH, T, T)
     int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    int HS = C / NH; // head size
+    float scale = 1.0 / sqrtf(HS);
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* out_bth = out + b * NH * T * T + h * T * T + t * T;
+            for (int nh = 0; nh < NH; nh++) {
+                // Q[b][nh][t][:] = inp[b][t][0][nh][:] (where : is the slice operator for hs)
+                const float* query_t = inp + b * T * C3 + t * C3 + nh * HS;
+                // out[b][nh][t][:]
+                float* out_bth = out + b * NH * T * T + nh * T * T + t * T;
 
                 // pass 1: calculate query dot key and maxval
                 for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    // K[b][nh][t2][:] = inp[b][t2][1][nh][:]
+                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + nh * HS + C; // +C because it's key
 
-                    // (query_t) dot (key_t2)
+                    // Q[b][nh][t][:] dot K[b][nh][t2][:]
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < HS; i++) {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
 
+                     // out[b][nh][t][t2] = val
                     out_bth[t2] = val;
                 }
                 for(int t2 = t + 1; t2 < T; ++t2) {
+                    // causal mask, using NAN to supress warnings -> it could be -inf
+                    // but it doesn't matter because in validate_result we ignore infinities/NANs
                     out_bth[t2] = NAN;
                 }
             }
@@ -101,31 +109,31 @@ void trimul_cpu(float* out, const float* inp,
 
 void permute_kernel(sycl::nd_item<1> id, float* q, float* k, float* v,
                                const float* inp,
-                               int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+                               int B, int T, int NH, int HS) {
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS)
+    // but instead, we have a single tensor QKV (inp) of shape (B, T, 3, NH, HS)
     int idx = id.get_global_id(0);
 
     // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
 
-    if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
-        int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
-        rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
+    if (idx < B * NH * T * HS) {
+        int b = idx / (NH * T * HS);
+        int rest = idx % (NH * T * HS);
+        int nh = rest / (T * HS);
+        rest = rest % (T * HS);
+        int t = rest / HS;
+        int hs = rest % HS;
 
         int inp_idx = \
-            (b * N * 3 * NH * d)
-            +   (n * 3 * NH * d)
-            +       (0 * NH * d)
-            +          (nh_ * d)
-            +                d_;
+            (b * T * 3 * NH * HS)
+            +   (t * 3 * NH * HS)
+            +       (0 * NH * HS)
+            +          (nh * HS)
+            +                hs;
 
         q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
+        k[idx] = inp[inp_idx + NH * HS];
+        v[idx] = inp[inp_idx + 2 * (NH * HS)];
     }
 }
 
@@ -149,7 +157,7 @@ void trimul_cublas(float* preatt,
     });
 
     // batched matrix multiply with oneDNN
-    const float alpha = 1.0f / sqrtf(HS); // Need to handle non 1.0f alpha
+    const float alpha = 1.0f / sqrtf(HS); 
     const float beta = 0.0f;
  
     // Setup engine and stream
@@ -236,12 +244,22 @@ void trimul_cublas(float* preatt,
  */
 
 // baseline implementation: 20 ms
-void matmul_tri_naive(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
-    // get coordinates of our block
-    int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
-    int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
+void matmul_tri_naive(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    // coordinate system:
+    // | - - - - - > j
+    // |
+    // |
+    // v
+    // i
+    // get coordinates of our block - each thread is responsible for a single 8x8 block.
+    int i_base = 128 * blockIdx_x(id) + 8 * threadIdx_x(id);
+    int j_base = 128 * blockIdx_y(id) + 8 * threadIdx_y(id);
 
-    // one more check to skip the upper diagonal in blocks that are on the diagonal.
+    // One more check to skip the upper diagonal in blocks that are on the diagonal.
+    // Note: we deliberately waste some compute on the jagged diagonal i.e. elements that belong
+    // to the upper triangle that should be masked out. This will be ignored due to the causal mask
+    // in the reference CPU implementation when used in the `validate_result` function.
+    // Alternatively this check should be done in the nested for loop below -> if (i > j) return.
     if(j_base > i_base)
         return;
 
@@ -251,17 +269,17 @@ void matmul_tri_naive(sycl::nd_item<3> id, float* p, int ps, const float* k, int
         for(int jo = 0; jo < 8; ++jo) {
             int j = j_base + jo;
             float val = 0;
-            for (int s = 0; s < hs; ++s) {
-                val += k[i * ks + s] * q[j * qs + s];
+            for (int s = 0; s < HS; ++s) {
+                val += q[i * QS + s] * k[j * KS + s];
             }
-            p[i * ps + j] = val * alpha;
+            p[i * PS + j] = val * alpha;
         }
     }
 }
 
 /*                     ** Chapter IV - ... **
  *
- *  Each worker is producing 64 combined cookies from 8 animals and 8 landscapes. They send there runners of 64 times
+ *  Each worker is producing 64 combined cookies from 8 animals and 8 landscapes. They send their runners 64 times
  *  to fetch the corresponding shapes. This is terribly inefficient; The runners need a minute or so for each trip,
  *  but making a cookie can be done in just a second.
  *
@@ -289,25 +307,25 @@ void matmul_tri_naive(sycl::nd_item<3> id, float* p, int ps, const float* k, int
  */
 
 // reorganize loops to enable data reuse: 3.5 ms
-void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
-    int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
-    int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
+void matmul_tri_registers(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    int i_base = 128 * blockIdx_x(id) + 8 * threadIdx_x(id);
+    int j_base = 128 * blockIdx_y(id) + 8 * threadIdx_y(id);
 
     if (j_base > i_base)
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; ++s) {
+    for (int hs = 0; hs < HS; ++hs) {
         float lhs[8];
         float rhs[8];
         for (int u = 0; u < 8; ++u) {
-            lhs[u] = k[u * ks + s];
-            rhs[u] = q[u * qs + s];
+            lhs[u] = q[u * QS + hs];
+            rhs[u] = k[u * KS + hs];
         }
 
         for (int i = 0; i < 8; ++i) {
@@ -319,7 +337,7 @@ void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k,
 
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 8; ++j) {
-            p[i * ps + j] = vals[i][j] * alpha;
+            p[i * PS + j] = vals[i][j] * alpha;
         }
     }
 }
@@ -331,7 +349,7 @@ void matmul_tri_registers(sycl::nd_item<3> id, float* p, int ps, const float* k,
  *  "Of course", the runner answers, "but they've asked me for an elephant, a lion, a zebra, and a goldfish. These
  *  are all over the place, I can't just pick them up at one spot (_strided acccess_).
  *  "But the lion is right next to the palm tree. You could bring those two together?", you confirm.
- *  "Yes", he says, "if the just asked for the different categories at the same time, that would make things
+ *  "Yes", he says, "if they just asked for the different categories at the same time, that would make things
  *  so much easier. See, I have this bucket, I could carry lots of things in one go if I could just scoop them up
  *  from the same place (_coalesced access_).
  *
@@ -361,29 +379,30 @@ void st_vec(float* address, sycl::float4 val) {
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha) {
-    int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
-    int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
+void matmul_tri3(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+    // Same logic as previous kernel we just load in float4 to improve coalescing
+    int i_base = 128 * blockIdx_x(id) + 8 * threadIdx_x(id);
+    int j_base = 128 * blockIdx_y(id) + 8 * threadIdx_y(id);
 
     if (j_base > i_base)
         return;
 
     // shift our pointers to the sub-block this thread is responsible for
-    k += i_base * ks;
-    q += j_base * qs;
-    p += i_base * ps + j_base;
+    q += i_base * QS;
+    k += j_base * KS;
+    p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int s = 0; s < hs; s += 4) {
+    for (int hs = 0; hs < HS; hs += 4) {
         // load in float4 to improve coalescing
         sycl::float4 rhs[8];
         for (int u = 0; u < 8; ++u) {
-            rhs[u] = ld_vec(q + u * qs + s);
+            rhs[u] = ld_vec(k + u * KS + hs);
         }
 
         for (int i = 0; i < 8; ++i) {
             // no need to keep lhs around for the i loop, its only reused in the j loop anyway.
-            sycl::float4 lhs = ld_vec(k + i * ks + s);
+            sycl::float4 lhs = ld_vec(q + i * QS + hs);
             for (int j = 0; j < 8; ++j) {
                 vals[i][j] += lhs.x() * rhs[j].x();
                 vals[i][j] += lhs.y() * rhs[j].y();
@@ -400,7 +419,7 @@ void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
             result.y() = vals[i][j + 1] * alpha;
             result.z() = vals[i][j + 2] * alpha;
             result.w() = vals[i][j + 3] * alpha;
-            st_vec(p + i * ps + j, result);
+            st_vec(p + i * PS + j, result);
         }
     }
 }
@@ -421,25 +440,25 @@ void matmul_tri3(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
  *  details.]
  *
  */
-void matmul_tri4(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, const float* q, int qs, int T, int hs, float alpha,
+void matmul_tri4(sycl::nd_item<3> id, float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha,
                  sycl::multi_ptr<float[128][32][2], sycl::access::address_space::local_space> lmem) {
-    int i_base = 128 * id.get_group(2) + 8 * id.get_local_id(2);
-    int j_base = 128 * id.get_group(1) + 8 * id.get_local_id(1);
+    int i_base = 128 * blockIdx_x(id) + 8 * threadIdx_x(id);
+    int j_base = 128 * blockIdx_y(id) + 8 * threadIdx_y(id);
 
     // we need all threads for loading data, so none of them can chicken out early, even
     // if they are not responsible for any useful result.
-    if (id.get_group(1) > id.get_group(2))
+    if (blockIdx_y(id) > blockIdx_x(id))
         return;
 
-    k += 128 * id.get_group(2) * ks;
-    q += 128 * id.get_group(1) * qs;
+    q += 128 * blockIdx_x(id) * QS;
+    k += 128 * blockIdx_y(id) * KS;
 
     float *shared = (float*) lmem.get_raw();
     float (*lhs_s)[32] = (float (*)[32]) shared;
     float (*rhs_s)[32] = (float (*)[32]) (shared + 128 * 32);
 
     float vals[8][8] = {};
-    for (int so = 0; so < hs; so += 32) {
+    for (int so = 0; so < HS; so += 32) {
         // Read a large slice of the input, worked on together by all threads.
         // They are organized differently for this part. We want to ensure
         // fully coalesced loads, so we let a single warp handle consecutive
@@ -447,22 +466,31 @@ void matmul_tri4(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
         // in one read operation.
         // note: threads may read data here that they don't need themselves.
         //       this really is a block-level operation.
+        // note2: 16x16 threads (i.e. the block) will, through this for loop, fetch 32 dims from 128 keys and 128 queries
+        // i.e. from Q/K, of shape (T, HS) take q[:128, so*32:(so+1)*32] and k[:128, so*32:(so+1)*32]
         sycl::group_barrier(id.get_group());
-        for(int y = id.get_local_id(1) / 2; y < 128; y += 8) {
-            int xo = (id.get_local_id(1) % 2) * 16;
-            lhs_s[y][id.get_local_id(2) + xo] = k[y * ks + so + id.get_local_id(2) + xo];
-            rhs_s[y][id.get_local_id(2) + xo] = q[y * qs + so + id.get_local_id(2) + xo];
+        for(int y = threadIdx_y(id) / 2; y < 128; y += 8) {
+            int xo = (threadIdx_y(id) % 2) * 16;
+            lhs_s[y][threadIdx_x(id) + xo] = q[y * QS + so + threadIdx_x(id) + xo];
+            rhs_s[y][threadIdx_x(id) + xo] = k[y * KS + so + threadIdx_x(id) + xo];
         }
         sycl::group_barrier(id.get_group());
 
+        // Now we compute a partial dot product (only 32 dims) for all combinations of keys and queries (128x128).
+        // Each thread does 8x8 of these partial dot products.
+        // E.g. thread (0,0) covers queries 0-7 and keys 0-7. More generally first row of threads
+        // (0,:) covers queries 0-7 with keys 0-127 and so on.
+        // In the next iterations of the outer (`so`) loop we'll be accumulating values to `vals` until we
+        // get the full dot product. We then later deposit it into the output matrix for all 8x8 blocks
+        // that are below the diagonal.
         for (int si = 0; si < 32; ++si) {
             float rhs[8];
             for (int u = 0; u < 8; ++u) {
-                rhs[u] = rhs_s[u + 8 * id.get_local_id(1)][(si + id.get_local_id(2)) % 32];
+                rhs[u] = rhs_s[u + 8 * threadIdx_y(id)][(si + threadIdx_x(id)) % 32];
             }
 
             for (int ii = 0; ii < 8; ++ii) {
-                float lhs = lhs_s[ii + 8 * id.get_local_id(2)][(si + id.get_local_id(2)) % 32];
+                float lhs = lhs_s[ii + 8 * threadIdx_x(id)][(si + threadIdx_x(id)) % 32];
                 for (int ji = 0; ji < 8; ++ji) {
                     vals[ii][ji] += lhs * rhs[ji];
                 }
@@ -483,7 +511,7 @@ void matmul_tri4(sycl::nd_item<3> id, float* p, int ps, const float* k, int ks, 
             result.y() = vals[ii][ji + 1] * alpha;
             result.z() = vals[ii][ji + 2] * alpha;
             result.w() = vals[ii][ji + 3] * alpha;
-            st_vec(p + i * ps + j, result);
+            st_vec(p + i * PS + j, result);
         }
     }
 }
@@ -498,24 +526,25 @@ void trimul_launcher_naive(float* out, const float* inp, int B, int T, int C, in
     DefaultQueue->parallel_for(sycl::nd_range<3>(grid_dim * block_dim, block_dim),
                                [=](sycl::nd_item<3> id) {
         // skip above the diagonal
-        if(id.get_group(1) > id.get_group(2))
+        if(blockIdx_y(id) > blockIdx_x(id))
             return;
 
         // set up indices
         int C3 = C*3;
-        int hs = C / NH; // head size
-        float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+        int HS = C / NH; // head size
+        float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
 
         // we put the "batch x head" dimension into the z block index.
-        int h = id.get_group(0) % NH;
-        int b = id.get_group(0) / NH;
+        int b = blockIdx_z(id) / NH;
+        int nh = blockIdx_z(id) % NH;
 
         // Get the base address for the current batch and head
-        const float* q = inp + b * T * C3 + h * hs;
-        const float* k = inp + b * T * C3 + h * hs + C;
-        float* r = out + (b*NH + h)*T*T;
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
-        matmul_tri_naive(id, r, T, q, C3, k, C3, T, hs, scale);
+        matmul_tri_naive(id, r, T, k, C3, q, C3, T, HS, scale);
     });
 }
 
@@ -529,24 +558,25 @@ void trimul_launcher_registers(float* out, const float* inp, int B, int T, int C
     DefaultQueue->parallel_for(sycl::nd_range<3>(grid_dim * block_dim, block_dim),
                                [=](sycl::nd_item<3> id) {
         // skip above the diagonal
-        if(id.get_group(1) > id.get_group(2))
+        if(blockIdx_y(id) > blockIdx_x(id))
             return;
 
         // set up indices
         int C3 = C*3;
-        int hs = C / NH; // head size
-        float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+        int HS = C / NH; // head size
+        float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
 
         // we put the "batch x head" dimension into the z block index.
-        int h = id.get_group(0) % NH;
-        int b = id.get_group(0) / NH;
+        int b = blockIdx_z(id) / NH;
+        int nh = blockIdx_z(id) % NH;
 
         // Get the base address for the current batch and head
-        const float* q = inp + b * T * C3 + h * hs;
-        const float* k = inp + b * T * C3 + h * hs + C;
-        float* r = out + (b*NH + h)*T*T;
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
-        matmul_tri_registers(id, r, T, q, C3, k, C3, T, hs, scale);
+        matmul_tri_registers(id, r, T, k, C3, q, C3, T, HS, scale);
     });
 }
 
@@ -560,24 +590,25 @@ void trimul_launcher_matmul_tri3(float* out, const float* inp, int B, int T, int
     DefaultQueue->parallel_for(sycl::nd_range<3>(grid_dim * block_dim, block_dim),
                                [=](sycl::nd_item<3> id) {
         // skip above the diagonal
-        if(id.get_group(1) > id.get_group(2))
+        if(blockIdx_y(id) > blockIdx_x(id))
             return;
-
+    
         // set up indices
         int C3 = C*3;
-        int hs = C / NH; // head size
-        float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+        int HS = C / NH; // head size
+        float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
 
         // we put the "batch x head" dimension into the z block index.
-        int h = id.get_group(0) % NH;
-        int b = id.get_group(0) / NH;
+        int b = blockIdx_z(id) / NH;
+        int nh = blockIdx_z(id) % NH;
 
         // Get the base address for the current batch and head
-        const float* q = inp + b * T * C3 + h * hs;
-        const float* k = inp + b * T * C3 + h * hs + C;
-        float* r = out + (b*NH + h)*T*T;
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
-        matmul_tri3(id, r, T, q, C3, k, C3, T, hs, scale);
+        matmul_tri3(id, r, T, k, C3, q, C3, T, HS, scale);
     });
 }
 
@@ -591,26 +622,27 @@ void trimul_launcher_matmul_tri4(float* out, const float* inp, int B, int T, int
     DefaultQueue->parallel_for(sycl::nd_range<3>(grid_dim * block_dim, block_dim),
                                [=](sycl::nd_item<3> id) {
         // skip above the diagonal
-        if(id.get_group(1) > id.get_group(2))
+        if(blockIdx_y(id) > blockIdx_x(id))
             return;
 
         // set up indices
         int C3 = C*3;
-        int hs = C / NH; // head size
-        float scale = 1.0f / sycl::sqrt(static_cast<float>(hs));
+        int HS = C / NH; // head size
+        float scale = 1.0f / sycl::sqrt(static_cast<float>(HS));
 
         // we put the "batch x head" dimension into the z block index.
-        int h = id.get_group(0) % NH;
-        int b = id.get_group(0) / NH;
+        int b = blockIdx_z(id) / NH;
+        int nh = blockIdx_z(id) % NH;
 
         // Get the base address for the current batch and head
-        const float* q = inp + b * T * C3 + h * hs;
-        const float* k = inp + b * T * C3 + h * hs + C;
-        float* r = out + (b*NH + h)*T*T;
+        // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
+        const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+        const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
+        float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
 
         sycl::multi_ptr<float[128][32][2], sycl::access::address_space::local_space> lmem = 
             syclx::group_local_memory_for_overwrite<float[128][32][2]>(id.get_group());
-        matmul_tri4(id, r, T, q, C3, k, C3, T, hs, scale, lmem);
+        matmul_tri4(id, r, T, k, C3, q, C3, T, HS, scale, lmem);
     });
 }
 
