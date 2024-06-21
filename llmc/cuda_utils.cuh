@@ -102,11 +102,11 @@ __device__ float cast_value<float, __nv_bfloat16>(__nv_bfloat16 val) {
 }
 
 template<typename Td, typename Ts>
-__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n) {
+__global__ void copy_and_cast_kernel(Td* dst, const Ts* src, size_t n, ptrdiff_t stride_dst, ptrdiff_t stride_src) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // need to try grid stride looping for more perf later
     if (idx < n) {
-        dst[idx] = cast_value<Td, Ts>(src[idx]);
+        dst[idx + stride_dst * blockIdx.y] = cast_value<Td, Ts>(src[idx + stride_src * blockIdx.y]);
     }
 }
 
@@ -190,7 +190,8 @@ __device__ __host__ constexpr unsigned int Get2dNoiseUint(int indexX, int indexY
 // stochastic rounding built on top of Squirel Noise above (with seed updated per step via xorshift)
 __device__ __forceinline__ void stochastic_rounding(float in, __nv_bfloat16 *out, unsigned int seed) {
     // todo - is this stochastic rounding *too good*? can we cut any corners?
-    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x, seed);
+    // makes sure each thread gets a different random number
+    unsigned int random = Get2dNoiseUint(threadIdx.x, blockIdx.x * blockDim.x + blockIdx.y, seed);
     unsigned int threshold = random & 0xFFFF;
     unsigned int float_bits = __float_as_uint(in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
