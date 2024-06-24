@@ -357,6 +357,101 @@ void  // todo - any warnings on Turing with only 1024 threads?
     }
 }
 
+void layernorm_backward_kernel7(sycl::nd_item<1> id, floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
+                        const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
+                        int B, int T, int C, sycl::local_accessor<float> lmem) {
+    float* shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C + 1
+    sycl::group block = id.get_group();
+    sycl::sub_group warp = id.get_sub_group();
+    int warpSize = size(warp);
+    int warpId = threadIdx_x(id) / warpSize; // warp index within a block
+    int warpsInBlock = blockDim_x(id) / warpSize;
+    int base_idx = blockIdx_x(id) * warpsInBlock + warpId;
+    int warpThreadIdx = threadIdx_x(id) % warpSize; // Thread index within the warp
+    int warps_in_grid = gridDim_x(id) * warpsInBlock;
+
+    // the first half of shared memory is bias, second is weight
+    float* dbias_shared = shared;
+    float* dweight_shared = shared + C;
+
+    // init shared memory to zero
+    #pragma unroll 4
+    for(int i = threadIdx_x(id); i < C; i+= blockDim_x(id)){
+       dbias_shared[i] = 0.0f;
+       dweight_shared[i] = 0.0f;
+    }
+    unsigned int *tmp_flag = (unsigned int*)(shared + C*2);
+    sycl::group_barrier(block);
+
+    for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
+        int b = idx / T;
+        int t = idx % T;
+
+        const floatX* dout_bt = dout + b * T * C + t * C;
+        const floatX* inp_bt = inp + b * T * C + t * C;
+        floatX* dinp_bt = dinp + b * T * C + t * C;
+        const float mean_bt = (float)mean[b * T + t];
+        const float rstd_bt = (float)rstd[b * T + t];
+
+        // first: two reduce operations
+        float dnorm_mean = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = warpThreadIdx; i < C; i  += warpSize) {
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * (float)dout_bt[i];
+            dnorm_mean += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean = warpReduceSum(warp, dnorm_mean);
+        dnorm_norm_mean = warpReduceSum(warp, dnorm_norm_mean);
+
+        dnorm_mean = dnorm_mean / C;
+        dnorm_norm_mean = dnorm_norm_mean / C;
+
+        // now iterate again and accumulate all the gradients
+        for (int i = warpThreadIdx; i < C; i += warpSize) {
+            // Fix this later
+            float dout_i = (float)dout_bt[i];
+            float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i = (float)weight[i] * dout_i;
+            // gradient contribution to bias
+            atomicAdd(&dbias_shared[i], dout_i);
+            // gradient contribution to weight
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
+            // gradient contribution to input
+            float dval = 0.0f;
+            dval += dnorm_i; // term 1
+            dval -= dnorm_mean; // term 2
+            dval -= norm_bti * dnorm_norm_mean; // term 3
+            dval *= rstd_bt; // final scale
+            dinp_bt[i] = (floatX)((float)dinp_bt[i] + dval);
+        }
+    }
+
+    // Accumulate into a FP32 scratchpad
+    // BF16 atomics are potentially much slower... and this is more precise!
+    sycl::group_barrier(block);
+    float* scratch_dbias = scratch;
+    float* scratch_dweight = scratch + C;
+    unsigned int* scratchFlag = (unsigned int*)(scratch + (2 * C));
+    for(int i = threadIdx_x(id); i < C; i+= blockDim_x(id)) {
+        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
+        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
+    }
+    sycl::group_barrier(block);
+    if (threadIdx_x(id) == 0) {
+        *tmp_flag = atomicAdd(scratchFlag, 1);
+    }
+    sycl::group_barrier(block);
+    if (*tmp_flag == gridDim_x(id)-1) {
+        for(int i = threadIdx_x(id); i < C; i+= blockDim_x(id)) {
+            // todo - potentially do stochastic rounding here as well
+            dbias[i] = (floatX)scratch_dbias[i];
+            dweight[i] = (floatX)scratch_dweight[i];
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -410,6 +505,22 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C, sycl::queue* stream) {
+    const int block_size = 512;
+    const int grid_size = (1024/block_size) * get_num_CUs();
+    size_t shared_mem_size = (2 * C + 1) * sizeof(float);
+
+    // Including this as part of the timing until we can parallelise it
+    // It should fully hide the cost and improve kernel perf by >5% if done in parallel using CUDA streams
+    stream->memset(scratch, 0, (1 + 2 * C) * sizeof(float));
+
+    stream->submit([&](sycl::handler& h) {
+        sycl::local_accessor<float> lmem(shared_mem_size, h);
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            layernorm_backward_kernel7(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, lmem);
+        });
+    });
+    /*
+    // 10 giving problems atm, use 7 for now
     const int block_size = 256;
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
     const int grid_size = blocks_per_sm * get_num_CUs();
@@ -427,4 +538,5 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
             layernorm_backward_kernel10(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, lmem);
         });
     });
+    */ 
 }

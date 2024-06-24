@@ -15,7 +15,7 @@ void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const fl
                                              std::bool_constant<UseAuxBuffer>, sycl::local_accessor<float> lmem) {
     sycl::sub_group warp = id.get_sub_group();
     constexpr const int bdx = 4;
-    constexpr const int bdy = WARP_SIZE / bdx;
+    constexpr const int bdy = WARP_SIZE32 / bdx;
 
     int warp_d = (int)threadIdx_x(id);
     int warp_c = (int)threadIdx_y(id);
@@ -45,7 +45,7 @@ void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const fl
     }
 
     float* shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw();
-    float (*sub_results)[WARP_SIZE][bdy] = (float (*)[WARP_SIZE][bdy])shared;
+    float (*sub_results)[WARP_SIZE32][bdy] = (float (*)[WARP_SIZE32][bdy])shared;
     auto Partition = syclex::get_fixed_size_group<4>(warp);
 
     // reduce within-warp results
@@ -207,15 +207,14 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
             });
         } else {
             // kernel 9 overwrites temp buffer, so no need to memset
-            float *dbias_buf = dbias_buffer;
             stream->submit([&](sycl::handler& h) {
                 sycl::local_accessor<float> lmem(x128::size*32*8, h);
                 h.parallel_for(sycl::nd_range<3>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<3> id) __SIMD32__ {
-                    matmul_backward_bias_kernel9(id, dbias_buf, dout, B, T, OC, std::bool_constant<true>{}, lmem);
+                    matmul_backward_bias_kernel9(id, dbias_buffer, dout, B, T, OC, std::bool_constant<true>{}, lmem);
                 });
             });
             stream->parallel_for(sycl::nd_range<1>(CEIL_DIV(OC, 256*f128::size)*256, 256), [=](sycl::nd_item<1> id) {
-                reduce_add_sum_kernel(id, dbias, dbias_buf, OC, grid_size_y);
+                reduce_add_sum_kernel(id, dbias, dbias_buffer, OC, grid_size_y);
             });
         }
     }

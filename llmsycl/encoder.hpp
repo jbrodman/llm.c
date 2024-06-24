@@ -284,15 +284,15 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, sycl::queue* stream) {
     
-    /*
+    
     // Replace this now while we figure out the early exit problem.
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
         encoder_backward_kernel(id, dwte, dwpe, dout, inp, B, T, C);
-    })*/
-   
+    });
+    /*
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
     const int N = T * C / x128::size;
@@ -361,5 +361,5 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
            wte_backward_kernel_noreturn<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
         });
     });
-    
+    */    
 }

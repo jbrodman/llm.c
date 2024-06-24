@@ -21,6 +21,9 @@ version 2 moves a lot of reduction to shared memory over global memory
 namespace syclx = sycl::ext::oneapi;
 using bfloat162 = sycl::marray<syclx::bfloat16, 2>; 
 
+#define WARP16 16
+#define WARP32 32
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -353,15 +356,9 @@ void layernorm_backward_kernel3(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweig
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * dout_i;
             // gradient contribution to bias
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dbias_ref(dbias_shared[i]);
-            dbias_ref += dout_i;
+            atomicAdd(&dbias_shared[i], dout_i);
             // gradient contribution to weight
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dweight_ref(dweight_shared[i]);
-            dweight_ref += norm_bti * dout_i;
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
             // gradient contribution to input
             float dval = 0.0f;
             dval += dnorm_i; // term 1
@@ -552,15 +549,9 @@ void layernorm_backward_kernel5(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweig
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * dout_i;
             // gradient contribution to bias
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dbias_ref(dbias_shared[i]);
-            dbias_ref += dout_i;
+            atomicAdd(&dbias_shared[i], dout_i);
             // gradient contribution to weight
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dweight_ref(dweight_shared[i]);
-            dweight_ref += norm_bti * dout_i;
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
             // gradient contribution to input
             float dval = 0.0f;
             dval += dnorm_i; // term 1
@@ -660,15 +651,9 @@ void layernorm_backward_kernel6(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweig
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * dout_i;
             // gradient contribution to bias
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dbias_ref(dbias_shared[i]);
-            dbias_ref += dout_i;
+            atomicAdd(&dbias_shared[i], dout_i);
             // gradient contribution to weight
-            sycl::atomic_ref<float, 
-                             sycl::memory_order::relaxed, 
-                             sycl::memory_scope::device> dweight_ref(dweight_shared[i]);
-            dweight_ref += norm_bti * dout_i;
+            atomicAdd(&dweight_shared[i], norm_bti * dout_i);
             // gradient contribution to input
             float dval = 0.0f;
             dval += dnorm_i; // term 1
@@ -686,21 +671,12 @@ void layernorm_backward_kernel6(sycl::nd_item<1> id, Tdinp* dinp, Tparams* dweig
     float* scratch_dweight = scratch + C;
     uint* scratchFlag = (uint*)(scratch + (2 * C));
     for(int i = threadIdx_x(id); i < C; i+= blockDim_x(id)) {
-        sycl::atomic_ref<float, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> dbias_ref(scratch_dbias[i]);
-        dbias_ref += dbias_shared[i];
-        sycl::atomic_ref<float, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> dweight_ref(scratch_dweight[i]);
-        dweight_ref += dweight_shared[i];
+        atomicAdd(&scratch_dbias[i], dbias_shared[i]);
+        atomicAdd(&scratch_dweight[i], dweight_shared[i]);
     }
     sycl::group_barrier(block);
     if (block.leader()) {
-        sycl::atomic_ref<uint, 
-                         sycl::memory_order::relaxed, 
-                         sycl::memory_scope::device> flag_ref(*scratchFlag);
-        *tmp_flag = flag_ref.fetch_add(1);
+        *tmp_flag = atomicAdd(scratchFlag, 1);
     }
     sycl::group_barrier(block);
     if (*tmp_flag == gridDim_x(id)-1) {
@@ -1142,7 +1118,7 @@ void layernorm_backward_kernel10(sycl::nd_item<1> id, floatX* dinp, floatX* dwei
     int iterations_C = ceil_div(C, C_per_iteration); // + 2;
 
     // the first half of shared memory is bias, second is weight
-    size_t rounded_C = ceil_div(C, (32 * x128::size)) * (32 * x128::size);
+    size_t rounded_C = ceil_div(C, (WARP16 * x128::size)) * (WARP16 * x128::size);
     float* dbias_shared = shared;
     float* dweight_shared = shared + rounded_C;
     // warp zero doesn't actually write to the _tmp_shared memory locations, so we don't need to reserve memory
@@ -1349,7 +1325,7 @@ void layernorm_backward2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
     DefaultQueue->memset(dbias_tmp, 0, C * sizeof(float));
     DefaultQueue->submit([&](sycl::handler& h) {
         sycl::local_accessor<float> lmem(shared_mem_size, h);
-        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) [[sycl::reqd_sub_group_size(32)]] {
             layernorm_backward_kernel2(id, dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C, dweight_tmp, dbias_tmp, lmem);
         });
     });
@@ -1486,15 +1462,17 @@ void layernorm_backward10(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* 
         if(block_size == 1024) {
             block_size = 512;
         }
-        assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
+        //assert(C % (32 * x128::size) == 0  && "Channels must be divisible by (32 * x128::size)");
         const int grid_size = (1024/block_size) * get_num_CUs(); // todo - heuristics for other GPUs?
-        size_t rounded_C = ceil_div(C, (32 * x128::size)) * (32 * x128::size);
-        size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+        size_t rounded_C = ceil_div(C, (WARP16 * x128::size)) * (WARP16 * x128::size);
+        size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - WARP16) * f128::size) * sizeof(float);
+        printf("shared_mem_size: %lu\n", shared_mem_size);
+        printf("local mem max size %lu\n", DefaultQueue->get_device().get_info<sycl::info::device::local_mem_size>());
 
         DefaultQueue->memset(scratch, 0, 1 * sizeof(float));
         DefaultQueue->submit([&](sycl::handler& h) {
             sycl::local_accessor<float> lmem(shared_mem_size, h);
-            h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+            h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) [[sycl::reqd_sub_group_size(WARP16)]] {
                 layernorm_backward_kernel10(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, lmem);
             });
         });
@@ -1554,7 +1532,7 @@ int main(int argc, char **argv) {
 
     int B = 8;
     int T = 1024;
-    int C = 768;
+    int C = 1600;
 
     sycl::queue defaultQueue(sycl::gpu_selector_v, 
                             {sycl::property::queue::in_order{},

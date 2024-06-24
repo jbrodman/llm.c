@@ -19,6 +19,7 @@ namespace syclex = sycl::ext::oneapi::experimental;
 // WarpSize is not a compile time constant
 // Defining here like this possibly allows the compiler to optimize better
 #define WARP_SIZE 16U
+#define WARP_SIZE32 32U
 #define __SIMD16__ [[sycl::reqd_sub_group_size(16)]]
 #define __SIMD32__ [[sycl::reqd_sub_group_size(32)]]
 
