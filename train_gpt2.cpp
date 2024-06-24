@@ -76,6 +76,20 @@ dnnl::stream *DefaultStream = nullptr;
 #include "llmsycl/zero.hpp"
 
 // ----------------------------------------------------------------------------
+// Timing helper
+timespec diff(timespec start, timespec end)
+{
+	timespec temp;
+	if ((end.tv_nsec-start.tv_nsec)<0) {
+		temp.tv_sec = end.tv_sec-start.tv_sec-1;
+		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec-start.tv_sec;
+		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
+	}
+	return temp;
+}
+
 
 // ----------------------------------------------------------------------------
 
@@ -1736,9 +1750,9 @@ int main(int argc, char *argv[]) {
         float grad_norm = gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, 1.0f, step+1, &multi_gpu_config);
         // zero out the gradients for the next iteration
         gpt2_zero_grad(&model);
-        // queue wait
+        // queue wait happens in zero grad
         clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_ms = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e6;
+        double time_elapsed_ms = (diff(start, end).tv_sec) * 1e3 + (diff(start, end).tv_nsec) / 1e6;
         //cudaCheck(cudaEventRecord(end));
         //cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
         // --------------- TRAINING SECTION END -------------------
