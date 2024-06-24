@@ -154,6 +154,29 @@ void wpe_backward_kernel(sycl::nd_item<2> id, floatX* dwpe,
     store128(dwpe_tc, packed_dwpe);
 }
 
+void encoder_backward_kernel(sycl::nd_item<1> id, floatX* dwte, floatX* dwpe,
+                                        const floatX* dout, const int* inp,
+                                        int B, int T, int C) {
+    int idx = id.get_global_id(0);
+    int N = B * T * C;
+
+    if (idx < N) {
+        int bt = idx / C;
+        int b = bt / T;
+        int t = bt % T;
+        int c = idx % C;
+
+        int ix = inp[b * T + t];
+
+        const floatX* dout_btc = dout + b * T * C + t * C + c;
+        floatX* dwte_ix = dwte + ix * C + c;
+        floatX* dwpe_tc = dwpe + t * C + c;
+
+        atomicAdd(dwte_ix, (floatX)*dout_btc);
+        atomicAdd(dwpe_tc, (floatX)*dout_btc);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launchers
 
@@ -173,7 +196,14 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       int* workload_indices, sycl::int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, sycl::queue* stream) {
-
+    // Replace this now while we figure out the early exit problem.
+    const int N = B * T * C;
+    const int block_size = 256;
+    const int grid_size = CEIL_DIV(N, block_size);
+    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
+        encoder_backward_kernel(id, dwte, dwpe, dout, inp, B, T, C);
+    });
+    /*
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
     const int N = T * C / x128::size;
@@ -242,4 +272,5 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
            wte_backward_kernel<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
         });
     });
+    */
 }

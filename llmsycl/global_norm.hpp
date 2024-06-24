@@ -95,7 +95,8 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
 }
 
 void global_norm_squared_aggregate(float* out, int max_num_block_sums, sycl::queue* stream) {
-    assert(max_num_block_sums > 0 && max_num_block_sums < 512);  // we need to accumulate the block sums in a single block
+    // Yeah, the SMs on Intel GPUs just aren't as big.
+    // assert(max_num_block_sums > 0 && max_num_block_sums < 1024);  // we need to accumulate the block sums in a single block
     // important to use 1024 here for determinism, otherwise blockreduce might introduce errors
     // well, we can't do more than 512 on Intel GPUs
     stream->parallel_for(sycl::nd_range<1>(512, 512), [=](sycl::nd_item<1> id) {

@@ -410,11 +410,15 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
 void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C, sycl::queue* stream) {
-    const int block_size = 512;
+    const int block_size = 256;
     const int blocks_per_sm = 2; // supported on every architecture and less cache thrashing than 3
     const int grid_size = blocks_per_sm * get_num_CUs();
     size_t rounded_C = CEIL_DIV(C, (32 * x128::size)) * (32 * x128::size);
     size_t shared_mem_size = (2 * rounded_C + 2 * (block_size - 32) * f128::size) * sizeof(float);
+    if (shared_mem_size > stream->get_device().get_info<sycl::info::device::local_mem_size>()) {
+        printf("Warning: layernorm_backward kernel requires too much shared memory, try smaller block size\n");
+        exit(EXIT_FAILURE);
+    }
 
     stream->memset(scratch, 0, 1 * sizeof(float)); // only need to reset the flag to 0
     stream->submit([&](sycl::handler& h) {

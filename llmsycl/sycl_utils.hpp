@@ -460,6 +460,35 @@ unsigned int atomicAdd(unsigned int* addr, unsigned int val) {
     return ref.fetch_add(val);
 }
 
+#ifdef ENABLE_BF16
+void atomicAdd(syclx::bfloat16* addr, syclx::bfloat16 val) {
+    /*
+    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
+    __nv_bfloat162* ptr_bf16 = reinterpret_cast<__nv_bfloat162*>(ptr_val & ~uintptr_t(0x3));
+    // Prepare the value to add, setting the other half to zero
+    __nv_bfloat162 add_val = (ptr_val & 0x3) ? __halves2bfloat162(__ushort_as_bfloat16(0), val)
+                                             : __halves2bfloat162(val, __ushort_as_bfloat16(0));
+    atomicAdd(ptr_bf16, add_val);
+    */
+    // I think the best thing to do here for now is to compare and swap
+    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
+    uint32_t* ptr_32bits = reinterpret_cast<uint32_t*>(ptr_val & ~uintptr_t(0x3));
+
+    sycl::atomic_ref<uint32_t,
+                     sycl::memory_order::relaxed,
+                     sycl::memory_scope::device> ref(*ptr_32bits);
+    uint32_t old_val = ref.load();
+    uint32_t new_val = old_val;
+    do {
+        sycl::marray<syclx::bfloat16, 2> h2 = *reinterpret_cast<sycl::marray<syclx::bfloat16, 2>*>(&old_val);
+        h2[0] += (ptr_val & 0x3) ? syclx::bfloat16(0.0f) : val;
+        h2[1] += (ptr_val & 0x3) ? val : syclx::bfloat16(0.0f);
+        new_val = *reinterpret_cast<uint32_t*>(&h2);
+    }
+    while (!ref.compare_exchange_weak(old_val, new_val));
+}
+#endif
+
 unsigned int atomicInc(unsigned int* addr, unsigned int val) {
     sycl::atomic_ref<unsigned int, 
                      sycl::memory_order::relaxed, 
