@@ -53,6 +53,7 @@ int get_max_num_block_sums(int* num_slices_all, int numel) {
     // const int grid_size = deviceProp.maxThreadsPerMultiProcessor * deviceProp.multiProcessorCount / block_size;
     int grid_size = main_stream->get_device().get_info<sycl::info::device::max_compute_units>();
     grid_size *= WARP_SIZE;
+    grid_size = CEIL_DIV(grid_size, block_size);
     assert(grid_size > 0);
     int max_num_block_sums = 0;
     for (int i = 0; i < numel; i++) {
