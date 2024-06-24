@@ -269,7 +269,7 @@ profile_gpt2cu: profile_gpt2.cu $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $^ $(NVCC_LDFLAGS) $(NVCC_INCLUDES) $(NVCC_LDLIBS)  $(CUDA_OUTPUT_FILE)
 
 train_gpt2sycl: train_gpt2.cpp
-	icpx -O3 -fsycl $(PFLAGS) $< -ldnnl -o $@
+	icpx -O3 -g -fsycl $(PFLAGS) $< -ldnnl -o $@
 
 test_gpt2sycl: test_gpt2.cpp
 	icpx -O3 -fsycl $(PFLAGS) $< -ldnnl -o $@

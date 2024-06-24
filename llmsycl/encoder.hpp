@@ -122,6 +122,93 @@ void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
     store128(dwte_ix, packed_in_out);
 }
 
+template <int BLOCK_SIZE=256>
+void wte_backward_kernel_noreturn(sycl::nd_item<2> id, floatX* dwte,
+                                    const sycl::int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
+                                    unsigned int seed, int B, int T, int C,
+                                    sycl::local_accessor<float> lmem) {
+    // In order to be deterministic, we preprocess the inputs on the cpu into "buckets"
+    // Each bucket corresponds to (WARP_SIZE * x128::size) channels for a single vocabulary token
+    // Each thread handles x128::size channels, e.g. 256 per warp for BF16
+    // Each block handles (BLOCK_SIZE / WARP_SIZE) elements in a single bucket in parallel
+    // If a bucket has less than 8 elements, some warps will return immediately
+    // If a bucket has more than 8 elements, we will loop over all of them
+    // The buckets are sorted on the CPU so the largest buckets start 1st
+    sycl::sub_group warp = id.get_sub_group();
+    int warp_size = size(warp);
+    int bucket = blockIdx_x(id);
+    int warp_id = threadIdx_x(id) / warp_size;
+    int lane_id = threadIdx_x(id) % warp_size;
+    int c_per_warp = warp_size * x128::size;
+
+    int bucket_start_idx = bucket_info[bucket].x();
+    int bucket_size = bucket_info[bucket].y();
+    int bucket_ix = bucket_info[bucket].z();
+    int c = bucket_info[bucket].w() * c_per_warp + (lane_id * x128::size);
+
+    // Each thread handles "x128::size" channels, so at fp8, each warp would handle 512 channels
+    // If C is not a multiple of this (e.g. 768), some buckets/c_groups cannot use the entire warp
+    // This could cause problems
+    //if (c >= C) { return; }
+    // Exit early if this is a small bucket and this warp doesn't have any items to process
+    //if (warp_id >= bucket_size) { return; }
+
+    float accum[x128::size] = {0.0f};
+    float* accum_shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+    floatX* dwte_ix;
+    x128 packed_in_out;
+
+    if (c < C && warp_id < bucket_size) {
+        //__shared__ float accum_shared[x128::size * BLOCK_SIZE];
+        for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/warp_size) {
+            int bt = workload_indices[bucket_start_idx + item];
+
+            const floatX* dout_btc = dout + bt * C + c;
+            x128 packed_inp1 = load128cs(dout_btc);
+            for (int k = 0; k < packed_inp1.size; k++) {
+                accum[k] += (float)packed_inp1[k];
+            }
+        }
+
+        if (warp_id != 0) {
+            // we accumulate into warp 0, so only the other warps need to write to shared memory
+            for (int k = 0; k < x128::size; k++) {
+                accum_shared[threadIdx_x(id) + k * BLOCK_SIZE] = accum[k];
+            }
+            // return; // only warp 0 is needed after writing to shared memory
+        }
+        else {
+            // Read dwte for warp 0 even if other warps are not finished yet to maximise latency tolerance
+            dwte_ix = dwte + bucket_ix * C + c;
+            packed_in_out = load128(dwte_ix);
+        }
+    } // bounds check
+
+    // note: threads which have returned are considered synchronised by CUDA so no risk of deadlock
+    // Not on Intel GPUs :(
+    sycl::group_barrier(id.get_group());
+
+    if (warp_id == 0) {
+        // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
+        for (int i = threadIdx_x(id)+warp_size; i < sycl::min(BLOCK_SIZE, bucket_size*warp_size); i += warp_size) {
+            for (int k = 0; k < x128::size; k++) {
+                accum[k] += accum_shared[i + k * BLOCK_SIZE];
+            }
+        }
+
+        // Add the result to dwte and write back to global memory (read-modify-write)
+        for (unsigned int k = 0; k < x128::size; k++) {
+            // We use stochastic rounding to go from FP32 to BF16
+            // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
+            // to avoid **potential** issues with positionX int SquirrelNoise5 argument overflowing which is UB
+            // and that somehow messing the quality of random numbers
+            stochastic_rounding(id, accum[k] + (float)packed_in_out[k], &packed_in_out[k], seed + k);
+        }
+        store128(dwte_ix, packed_in_out);
+    }
+}
+
+
 void wpe_backward_kernel(sycl::nd_item<2> id, floatX* dwpe,
                                     const floatX* dout, const int* inp,
                                     int B, int T, int C, unsigned int seed) {
@@ -186,7 +273,7 @@ void encoder_forward(floatX* out,
     const int block_size = 256;
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
-    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) __SIMD16__ {
         encoder_forward_kernel3(id, out, inp, wte, wpe, B, T, C);
     });
 }
@@ -196,21 +283,23 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       int* workload_indices, sycl::int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, sycl::queue* stream) {
+    
+    /*
     // Replace this now while we figure out the early exit problem.
     const int N = B * T * C;
     const int block_size = 256;
     const int grid_size = CEIL_DIV(N, block_size);
     stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
         encoder_backward_kernel(id, dwte, dwpe, dout, inp, B, T, C);
-    });
-    /*
+    })*/
+   
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
     const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
     sycl::range<2> grid_dim(1, grid_size);
     sycl::range<2> block_dim(1, block_size);
-    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD16__ {
         wpe_backward_kernel(id, dwpe, dout, inp, B, T, C, seed);
     });
 
@@ -268,9 +357,9 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
         sycl::local_accessor<float> lmem(sycl::range<1>(256 * x128::size), h);
         sycl::range<2> grid_dim(1, num_buckets);
         sycl::range<2> block_dim(1, 256);
-        h.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
-           wte_backward_kernel<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
+        h.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD16__ {
+           wte_backward_kernel_noreturn<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
         });
     });
-    */
+    
 }
