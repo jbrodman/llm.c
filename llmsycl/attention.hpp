@@ -88,11 +88,9 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, floatX* out, float inv_tempera
     // uses the online softmax algorithm
     assert(T % 4  == 0);
     sycl::sub_group warp = id.get_sub_group();
-    int warp_size = size(warp);
-    // Maybe change this back to a const later?
-    int lane_id = threadIdx_x(id) % warp_size;
-    int warp_id = threadIdx_x(id) / warp_size;
-    int num_warps = blockDim_x(id) / warp_size;
+    int lane_id = threadIdx_x(id) % WARP_SIZE;
+    int warp_id = threadIdx_x(id) / WARP_SIZE;
+    int num_warps = blockDim_x(id) / WARP_SIZE;
 
     // micro-optimization: we iterate backwards so that
     // after the softmax backward operation completes, the cache retains the
@@ -115,7 +113,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, floatX* out, float inv_tempera
     float sumval = 0.0f;
 
     const floatX* x_aligned = reinterpret_cast<const floatX*>(__builtin_assume_aligned(x, 16));
-    for (int i = lane_id; i < pos_by_4; i += warp_size) {
+    for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
         float regarray[4];
         for (int k = 0; k < 4; ++k) {
             regarray[k] = (float)x_aligned[4*i + k];
@@ -144,7 +142,7 @@ void softmax_forward_kernel5(sycl::nd_item<1> id, floatX* out, float inv_tempera
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = lane_id; i <= own_pos; i += warp_size) {
+    for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
         // recalculation is faster than doing the round-trip through memory.
         float ev = sycl::exp(inv_temperature * ((float)__ldcs(x + i) - global_maxval));
         __stcs(out + idx * T + i, (floatX)(ev * norm));
@@ -269,7 +267,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     // multiply all elements of preatt elementwise by scale
     float scale = 1.f / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
-    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) __SIMD32__ {
         softmax_forward_kernel5(id, att, scale, preatt, B * NH, T);
     });
 

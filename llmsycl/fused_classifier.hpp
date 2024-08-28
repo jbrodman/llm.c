@@ -85,6 +85,12 @@ void
         losses[idx] = (floatX)(-sycl::log(prob));
     }
 
+    // without this synchronization point we have a race condition:
+    // the logits used above to compute the loss are concurrently (race) modified to carry backward pass grads.
+    // since the "logits" are overwritten to be in the [-1, 1] range and sp.Offset is sometimes smaller than -90
+    // we errouneously end up computing exp^(90+) which gives us infinities in the loss! this is the fix.
+    sycl::group_barrier(id.get_group());
+
     // calculate the gradients directly, saves bandwidth from probs during training
     // but also supports writing probs for inference-only and debugging
     const floatX* logits_vec = logits + idx * P;
@@ -137,7 +143,7 @@ void fused_classifier(Type* logits, Type* losses,
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = N;
-    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) __SIMD32__ {
         fused_classifier_kernel5(id, logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P);
     });
 }

@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
     double elapsed_time_cpu = (double)(end - start) / CLOCKS_PER_SEC;
 
     // calculate the GPU version (using default hyperparams)
-    adamw(defaultQueue, kernel_num, d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters);
+    adamw(kernel_num, d_params_memory, d_grads_memory, d_m_memory, d_v_memory, t, num_parameters);
 
     // compare
     printf("Checking correctness...\n");

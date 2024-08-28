@@ -21,10 +21,9 @@ void layernorm_forward_kernel3(sycl::nd_item<1> id, floatX* __restrict__ out, fl
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
                                     const floatX* __restrict__ bias, int N, int C) {
     sycl::sub_group warp = id.get_sub_group();
-    int warp_size = size(warp);
-    int lane_id = threadIdx_x(id) % warp_size;
-    int warp_id = threadIdx_x(id) / warp_size;
-    int num_warps = blockDim_x(id) / warp_size;
+    int lane_id = threadIdx_x(id) % WARP_SIZE;
+    int warp_id = threadIdx_x(id) / WARP_SIZE;
+    int num_warps = blockDim_x(id) / WARP_SIZE;
 
     int idx = blockIdx_x(id) * num_warps + warp_id;
     if(idx >= N) { return; } // guard
@@ -34,7 +33,7 @@ void layernorm_forward_kernel3(sycl::nd_item<1> id, floatX* __restrict__ out, fl
 
     // mean
     float sum = 0.0f;
-    for (int i = lane_id; i < C; i += warp_size) {
+    for (int i = lane_id; i < C; i += WARP_SIZE) {
         sum += (float)x[i];
     }
     sum = warpReduceSum(warp, sum);
@@ -45,7 +44,7 @@ void layernorm_forward_kernel3(sycl::nd_item<1> id, floatX* __restrict__ out, fl
 
     // rstd
     sum = 0.0f;
-    for (int i = lane_id; i < C; i += warp_size) {
+    for (int i = lane_id; i < C; i += WARP_SIZE) {
         float diff = (float)x[i] - m;
         sum += diff * diff;
     }
@@ -57,7 +56,7 @@ void layernorm_forward_kernel3(sycl::nd_item<1> id, floatX* __restrict__ out, fl
 
     // final normalization and scaling by weight/bias
     floatX* o = out + idx * C;
-    for (int c = lane_id; c < C; c += warp_size) {
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
         // load and store using the .cs "streaming" hint to the compiler,
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
@@ -363,11 +362,10 @@ void layernorm_backward_kernel7(sycl::nd_item<1> id, floatX* dinp, floatX* dweig
     float* shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw(); // size = 2 * C + 1
     sycl::group block = id.get_group();
     sycl::sub_group warp = id.get_sub_group();
-    int warpSize = size(warp);
-    int warpId = threadIdx_x(id) / warpSize; // warp index within a block
-    int warpsInBlock = blockDim_x(id) / warpSize;
+    int warpId = threadIdx_x(id) / WARP_SIZE; // warp index within a block
+    int warpsInBlock = blockDim_x(id) / WARP_SIZE;
     int base_idx = blockIdx_x(id) * warpsInBlock + warpId;
-    int warpThreadIdx = threadIdx_x(id) % warpSize; // Thread index within the warp
+    int warpThreadIdx = threadIdx_x(id) % WARP_SIZE; // Thread index within the warp
     int warps_in_grid = gridDim_x(id) * warpsInBlock;
 
     // the first half of shared memory is bias, second is weight
@@ -396,7 +394,7 @@ void layernorm_backward_kernel7(sycl::nd_item<1> id, floatX* dinp, floatX* dweig
         // first: two reduce operations
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
-        for (int i = warpThreadIdx; i < C; i  += warpSize) {
+        for (int i = warpThreadIdx; i < C; i  += WARP_SIZE) {
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * (float)dout_bt[i];
             dnorm_mean += dnorm_i;
@@ -409,7 +407,7 @@ void layernorm_backward_kernel7(sycl::nd_item<1> id, floatX* dinp, floatX* dweig
         dnorm_norm_mean = dnorm_norm_mean / C;
 
         // now iterate again and accumulate all the gradients
-        for (int i = warpThreadIdx; i < C; i += warpSize) {
+        for (int i = warpThreadIdx; i < C; i += WARP_SIZE) {
             // Fix this later
             float dout_i = (float)dout_bt[i];
             float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
@@ -461,7 +459,7 @@ void layernorm_forward(floatX* out, floatX* mean, floatX* rstd,
     const int block_size = 512;
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * WARP_SIZE, block_size);
-    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) __SIMD16__ {
+    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) __SIMD32__ {
         layernorm_forward_kernel3(id, out, mean, rstd, inp, weight, bias, N, C);
     });
 }
@@ -470,7 +468,7 @@ void residual_forward(floatX* out, const floatX* inp1, const floatX* inp2, int N
     const int block_size = 256;
     assert(N % block_size == 0);
     const int grid_size = CEIL_DIV(N, block_size * x128::size);
-    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) __SIMD16__ {
+    stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id)  {
         residual_forward_kernel(id, out, inp1, inp2);
     });
 }
@@ -492,7 +490,7 @@ void fused_residual_forward5(floatX* residual, floatX* normed, floatX* mean, flo
            sycl::local_accessor<char> lmem(smem, h);
            sycl::range<2> grid_dim(1, grid_size);
            sycl::range<2> block_dim(block_y, WARP_SIZE);
-           h.parallel_for(sycl::nd_range<2>(grid_dim * block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD16__ {
+           h.parallel_for(sycl::nd_range<2>(grid_dim * block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD32__ {
                fused_residual_forward_kernel5(id, residual, normed, mean, rstd, inp1, inp2, weight, bias, N, C, lmem);
            });
         });
@@ -515,7 +513,7 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
 
     stream->submit([&](sycl::handler& h) {
         sycl::local_accessor<float> lmem(shared_mem_size, h);
-        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) {
+        h.parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> id) __SIMD32__ {
             layernorm_backward_kernel7(id, dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C, lmem);
         });
     });

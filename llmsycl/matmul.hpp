@@ -15,7 +15,7 @@ void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const fl
                                              std::bool_constant<UseAuxBuffer>, sycl::local_accessor<float> lmem) {
     sycl::sub_group warp = id.get_sub_group();
     constexpr const int bdx = 4;
-    constexpr const int bdy = WARP_SIZE32 / bdx;
+    constexpr const int bdy = WARP_SIZE / bdx;
 
     int warp_d = (int)threadIdx_x(id);
     int warp_c = (int)threadIdx_y(id);
@@ -45,7 +45,7 @@ void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const fl
     }
 
     float* shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw();
-    float (*sub_results)[WARP_SIZE32][bdy] = (float (*)[WARP_SIZE32][bdy])shared;
+    float (*sub_results)[WARP_SIZE][bdy] = (float (*)[WARP_SIZE][bdy])shared;
     auto Partition = syclex::get_fixed_size_group<4>(warp);
 
     // reduce within-warp results
@@ -83,7 +83,7 @@ void matmul_backward_bias_kernel9(sycl::nd_item<3> id, OutFloat* dbias, const fl
 }
 
 void reduce_add_sum_kernel(sycl::nd_item<1> id, floatX* dst, const float* src, size_t n, size_t m) {
-    const size_t idx = (id.get_global_id(0)) * f128::size;
+    const size_t idx = (blockIdx_x(id) * blockDim_x(id) + threadIdx_x(id)) * f128::size;
     assert(n % x128::size == 0);
     if (idx < n) {
         f128 acc;
@@ -186,7 +186,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
        // Block size is 1024 | 768 threads (32|24 warps) and we reduce those values into 1 at the end
         const int block_size = 256;
 
-        sycl::range<3> block_dim((unsigned)block_size/32, 8, 4); 
+        sycl::range<3> block_dim((unsigned)block_size/WARP_SIZE, 8, 4); 
         const int OC_per_warp = block_dim[1] * x128::size; // 64 at BF16
         const int grid_size_x = CEIL_DIV(OC, OC_per_warp); // e.g. 12 horizontal blocks for 768 OCs at BF16
         int size = stream->get_device().get_info<sycl::info::device::max_compute_units>();
@@ -213,7 +213,7 @@ void matmul_backward(floatX* dinp, floatX* dweight, floatX* dbias,
                     matmul_backward_bias_kernel9(id, dbias_buffer, dout, B, T, OC, std::bool_constant<true>{}, lmem);
                 });
             });
-            stream->parallel_for(sycl::nd_range<1>(CEIL_DIV(OC, 256*f128::size)*256, 256), [=](sycl::nd_item<1> id) {
+            stream->parallel_for(sycl::nd_range<1>(CEIL_DIV(OC, 256*f128::size)*256, 256), [=](sycl::nd_item<1> id) __SIMD32__ {
                 reduce_add_sum_kernel(id, dbias, dbias_buffer, OC, grid_size_y);
             });
         }

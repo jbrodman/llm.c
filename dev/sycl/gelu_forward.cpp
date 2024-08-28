@@ -22,17 +22,6 @@ version 1 is naive port from CPU code to kernel
 // turn on bf16 as default, done up here for now
 #define ENABLE_BF16
 
-#if defined(ENABLE_BF16)
-typedef sycl::ext::oneapi::bfloat16 floatX;
-typedef sycl::ext::oneapi::bfloat16 floatN;
-#elif defined(ENABLE_FP16)
-typedef sycl::half floatX;
-typedef sycl::half floatN;
-#else
-typedef float floatX;
-typedef float floatN;
-#endif
-
 typedef Packed128<floatX> x128;
 
 // ----------------------------------------------------------------------------

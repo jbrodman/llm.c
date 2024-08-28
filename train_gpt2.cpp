@@ -1126,17 +1126,24 @@ float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
 
 void gpt2_free(GPT2 *model) {
     sycl::free(model->params_memory, *main_stream);
+    model->params_memory = nullptr;
     sycl::free(model->grads_memory, *main_stream);
+    model->grads_memory = nullptr;
     sycl::free(model->m_memory, *main_stream);
+    model->m_memory = nullptr;
     sycl::free(model->v_memory, *main_stream);
+    model->v_memory = nullptr;
     sycl::free(model->master_weights, *main_stream);
+    model->master_weights = nullptr;
     sycl::free(model->acts_memory, *main_stream);
+    model->acts_memory = nullptr;
     sycl::free(model->inputs, *main_stream);
+    model->inputs = nullptr;
     sycl::free(model->targets, *main_stream);
+    model->targets = nullptr;
     sycl::free(model->cpu_losses, *main_stream);
     sycl::free(model->cpu_losses_fp32, *main_stream);
-    //free(model->cpu_losses);
-    //free(model->cpu_losses_fp32);
+
     free(model->workload_indices);
     free(model->bucket_info);
 }

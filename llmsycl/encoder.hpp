@@ -56,11 +56,10 @@ void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
     // If a bucket has more than 8 elements, we will loop over all of them
     // The buckets are sorted on the CPU so the largest buckets start 1st
     sycl::sub_group warp = id.get_sub_group();
-    int warp_size = size(warp);
     int bucket = blockIdx_x(id);
-    int warp_id = threadIdx_x(id) / warp_size;
-    int lane_id = threadIdx_x(id) % warp_size;
-    int c_per_warp = warp_size * x128::size;
+    int warp_id = threadIdx_x(id) / WARP_SIZE;
+    int lane_id = threadIdx_x(id) % WARP_SIZE;
+    int c_per_warp = WARP_SIZE * x128::size;
 
     int bucket_start_idx = bucket_info[bucket].x();
     int bucket_size = bucket_info[bucket].y();
@@ -78,7 +77,7 @@ void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
     //__shared__ float accum_shared[x128::size * BLOCK_SIZE];
     float* accum_shared = lmem.get_multi_ptr<sycl::access::decorated::no>().get_raw();
 
-    for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/warp_size) {
+    for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/WARP_SIZE) {
         int bt = workload_indices[bucket_start_idx + item];
 
         const floatX* dout_btc = dout + bt * C + c;
@@ -105,7 +104,7 @@ void wte_backward_kernel(sycl::nd_item<2> id, floatX* dwte,
     sycl::group_barrier(id.get_group());
 
     // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
-    for (int i = threadIdx_x(id)+warp_size; i < sycl::min(BLOCK_SIZE, bucket_size*warp_size); i += warp_size) {
+    for (int i = threadIdx_x(id)+WARP_SIZE; i < sycl::min(unsigned(BLOCK_SIZE), bucket_size*WARP_SIZE); i += WARP_SIZE) {
         for (int k = 0; k < x128::size; k++) {
             accum[k] += accum_shared[i + k * BLOCK_SIZE];
         }
@@ -135,11 +134,10 @@ void wte_backward_kernel_noreturn(sycl::nd_item<2> id, floatX* dwte,
     // If a bucket has more than 8 elements, we will loop over all of them
     // The buckets are sorted on the CPU so the largest buckets start 1st
     sycl::sub_group warp = id.get_sub_group();
-    int warp_size = size(warp);
     int bucket = blockIdx_x(id);
-    int warp_id = threadIdx_x(id) / warp_size;
-    int lane_id = threadIdx_x(id) % warp_size;
-    int c_per_warp = warp_size * x128::size;
+    int warp_id = threadIdx_x(id) / WARP_SIZE;
+    int lane_id = threadIdx_x(id) % WARP_SIZE;
+    int c_per_warp = WARP_SIZE * x128::size;
 
     int bucket_start_idx = bucket_info[bucket].x();
     int bucket_size = bucket_info[bucket].y();
@@ -160,7 +158,7 @@ void wte_backward_kernel_noreturn(sycl::nd_item<2> id, floatX* dwte,
 
     if (c < C && warp_id < bucket_size) {
         //__shared__ float accum_shared[x128::size * BLOCK_SIZE];
-        for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/warp_size) {
+        for(int item = warp_id; item < bucket_size; item += BLOCK_SIZE/WARP_SIZE) {
             int bt = workload_indices[bucket_start_idx + item];
 
             const floatX* dout_btc = dout + bt * C + c;
@@ -190,7 +188,7 @@ void wte_backward_kernel_noreturn(sycl::nd_item<2> id, floatX* dwte,
 
     if (warp_id == 0) {
         // Accumulate into warp 0's registers by reading the values of the other warps in shared memory
-        for (int i = threadIdx_x(id)+warp_size; i < sycl::min(BLOCK_SIZE, bucket_size*warp_size); i += warp_size) {
+        for (int i = threadIdx_x(id)+WARP_SIZE; i < sycl::min(unsigned(BLOCK_SIZE), bucket_size*WARP_SIZE); i += WARP_SIZE) {
             for (int k = 0; k < x128::size; k++) {
                 accum[k] += accum_shared[i + k * BLOCK_SIZE];
             }
@@ -217,7 +215,7 @@ void wpe_backward_kernel(sycl::nd_item<2> id, floatX* dwpe,
     // For each "channel position" we sum the gradients for every batch at that C/T element
     // This way each dwte element is only updated once, and the kernel is fully deterministic!
     // The previous kernel was not deterministic, as batches were aggregated with atomicAdd
-    int idx = (id.get_global_id(0)) * x128::size;
+    int idx = (blockIdx_x(id) * blockDim_x(id) + threadIdx_x(id)) * x128::size;
     if (idx >= T * C) { return; }
 
     // if C is not a multiple of WARP_SIZE*x128::size, it's OK for some warps to handle multiple t
@@ -284,7 +282,7 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, sycl::queue* stream) {
     
-    
+    /*
     // Replace this now while we figure out the early exit problem.
     const int N = B * T * C;
     const int block_size = 256;
@@ -292,14 +290,14 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     stream->parallel_for(sycl::nd_range<1>(grid_size*block_size, block_size), [=](sycl::nd_item<1> id) {
         encoder_backward_kernel(id, dwte, dwpe, dout, inp, B, T, C);
     });
-    /*
+    */
     // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
     const int N = T * C / x128::size;
     const int grid_size = CEIL_DIV(N, block_size);
     sycl::range<2> grid_dim(1, grid_size);
     sycl::range<2> block_dim(1, block_size);
-    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD16__ {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD32__ {
         wpe_backward_kernel(id, dwpe, dout, inp, B, T, C, seed);
     });
 
@@ -357,9 +355,8 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
         sycl::local_accessor<float> lmem(sycl::range<1>(256 * x128::size), h);
         sycl::range<2> grid_dim(1, num_buckets);
         sycl::range<2> block_dim(1, 256);
-        h.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD16__ {
+        h.parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD32__ {
            wte_backward_kernel_noreturn<256>(id, dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C, lmem);
         });
     });
-    */    
 }

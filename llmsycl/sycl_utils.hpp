@@ -515,10 +515,10 @@ inline void stochastic_rounding(sycl::nd_item<2> id, float in, syclx::bfloat16 *
     // todo - is this stochastic rounding *too good*? can we cut any corners?
     unsigned int random = Get2dNoiseUint(threadIdx_x(id), blockIdx_x(id) * blockDim_x(id) + blockIdx_y(id), seed);
     unsigned int threshold = random & 0xFFFF;
-    unsigned int float_bits =  *reinterpret_cast<unsigned int*>(&in);
+    unsigned int float_bits = sycl::bit_cast<unsigned int>(in);
     unsigned int rounded_bits = float_bits & 0x0000FFFF;
     float_bits = (rounded_bits > threshold) ? (float_bits | 0xFFFF) : (float_bits  & ~0xFFFF);
-    *out = syclx::bfloat16(*reinterpret_cast<float*>(&float_bits));
+    *out = syclx::bfloat16(sycl::bit_cast<float>(float_bits));
 }
 inline void stochastic_rounding(sycl::nd_item<2> id, float in, sycl::half *out, unsigned int random) {
     *out = (float)in; // todo - implement this...

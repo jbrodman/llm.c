@@ -333,11 +333,11 @@ int main(int argc, char *argv[]) {
     }
     
     // Finally, let's check determinism
-    gpt2_write_to_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    gpt2_write_to_checkpoint(&model, "test_gpt2sycl_model.ckpt");
 
     DataLoader loader;
     dataloader_init(&loader, "dev/data/tinyshakespeare/tiny_shakespeare_val.bin", B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 1);
-    save_state("test_gpt2cu_state.ckpt", 10, &model, &loader);
+    save_state("test_gpt2sycl_state.ckpt", 10, &model, &loader);
     int tokens[10];
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
@@ -351,9 +351,9 @@ int main(int argc, char *argv[]) {
 
     // reload
     gpt2_free(&model);
-    gpt2_build_from_checkpoint(&model, "test_gpt2cu_model.ckpt");
+    gpt2_build_from_checkpoint(&model, "test_gpt2sycl_model.ckpt");
     int ld_step;
-    load_state(&ld_step, &model, &loader, "test_gpt2cu_state.ckpt");
+    load_state(&ld_step, &model, &loader, "test_gpt2sycl_state.ckpt");
     for (int step = 0; step < 10; step++) {
         dataloader_next_batch(&loader);
         gpt2_forward(&model, loader.inputs, loader.targets, B, T);
@@ -380,8 +380,8 @@ int main(int argc, char *argv[]) {
     printf("overall okay: %d\n", allok);
 
     // delete intermediate test files
-    remove("test_gpt2cu_model.ckpt");
-    remove("test_gpt2cu_state.ckpt");
+    remove("test_gpt2sycl_model.ckpt");
+    remove("test_gpt2sycl_state.ckpt");
 
     // free everything
     dataloader_free(&loader);

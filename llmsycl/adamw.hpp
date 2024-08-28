@@ -19,7 +19,7 @@ template <typename Tp, typename Tg>
 void adamw_update(sycl::nd_item<2> id, Tp* params_memory, float* master_params_memory, Tg* grads_memory, float* m_memory, float* v_memory, size_t num_parameters,
                              float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay,
                              float grad_scale, unsigned int seed) {
-    int idx = id.get_global_id(0);
+    int idx = blockIdx_x(id) * blockDim_x(id) + threadIdx_x(id);
     if (idx >= num_parameters) { return; }  // guard
 
     // get the gradient, m, and v for this parameter

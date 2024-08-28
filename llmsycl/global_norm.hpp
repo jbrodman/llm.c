@@ -60,7 +60,7 @@ int get_max_num_block_sums(int* num_slices_all, int numel) {
         int num_slices = num_slices_all[i];
         const int gx = CEIL_DIV(grid_size, num_slices);
         const int gy = num_slices;
-        max_num_block_sums = sycl::max(max_num_block_sums, gx * gy);
+        max_num_block_sums = std::max(max_num_block_sums, gx * gy);
     }
 
     return max_num_block_sums;
@@ -83,21 +83,21 @@ void global_norm_squared(float* out, const T* values, size_t count, ptrdiff_t st
     const int gx = CEIL_DIV(grid_size, num_slices);
     const int gy = num_slices;
 
-    assert(gx * gy < 1024);  // we want to later accumulate the block sums in a single block
+    assert(gx * gy < 512);  // we want to later accumulate the block sums in a single block
 
     if (reset) {
         stream->memset(out, 0, max_num_block_sums * sizeof(float));
     }
     sycl::range<2> grid_dim(gy, gx);
     sycl::range<2> block_dim(1, block_size);
-    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) {
+    stream->parallel_for(sycl::nd_range<2>(grid_dim*block_dim, block_dim), [=](sycl::nd_item<2> id) __SIMD32__ {
         global_norm_squared_kernel(id, out, values, count, stride);
     });
 }
 
 void global_norm_squared_aggregate(float* out, int max_num_block_sums, sycl::queue* stream) {
     // Yeah, the SMs on Intel GPUs just aren't as big.
-    // assert(max_num_block_sums > 0 && max_num_block_sums < 1024);  // we need to accumulate the block sums in a single block
+    assert(max_num_block_sums > 0 && max_num_block_sums < 512);  // we need to accumulate the block sums in a single block
     // important to use 1024 here for determinism, otherwise blockreduce might introduce errors
     // well, we can't do more than 512 on Intel GPUs
     stream->parallel_for(sycl::nd_range<1>(512, 512), [=](sycl::nd_item<1> id) {
