@@ -1015,6 +1015,14 @@ float gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, fl
     } else {
         // in regular DDP, backward has averaged the gradients across all GPUs
         // so each GPU can compute the squared norm over the whole grad vector, with no added comms needed
+#if 0   // SYCL reductions make this cleaner and avoid extra kernel launches
+         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
+         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
+#else
+        main_stream->parallel_for(model->num_parameters, sycl::reduction(grad_norm_squared, sycl::plus<>()), [=](size_t i, auto& reducer) {
+          reducer += (float) grads_memory[i] * (float) grads_memory[i];
+        });
+#endif
         global_norm_squared(grad_norm_squared, grads_memory, model->num_parameters, 0, 1, max_num_block_sums, true, main_stream);
         global_norm_squared_aggregate(grad_norm_squared, max_num_block_sums, main_stream);
         main_stream->memcpy(&grad_norm_squared_cpu, grad_norm_squared, sizeof(float)).wait();
